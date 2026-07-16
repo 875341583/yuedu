@@ -12,6 +12,15 @@ subprojects {
 subprojects {
     project.evaluationDependsOn(":app")
 }
+// Fix: file_picker 11.x references flutter.compileSdkVersion which is not
+// available in plugin subprojects. Inject a stub before evaluation.
+subprojects { subproject ->
+    subproject.ext.set("flutter", [
+        compileSdkVersion: 35,
+        minSdkVersion: 21,
+        targetSdkVersion: 35,
+    ])
+}
 
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
