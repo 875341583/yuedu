@@ -12,10 +12,14 @@ class TypesetConfig {
   /// 容器宽度（逻辑像素）
   final double containerWidth;
 
+  /// 字体族名（用于精确度量，null=系统默认字体）
+  final String? fontFamily;
+
   const TypesetConfig({
     this.fontSize = 16.0,
     this.lineHeightRatio = 1.6,
     this.containerWidth = 360.0,
+    this.fontFamily,
   });
 }
 

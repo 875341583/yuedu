@@ -248,6 +248,7 @@ class _ReaderPageState extends State<ReaderPage> {
       fontSize: _config.fontSize,
       lineHeightRatio: _config.lineHeightRatio,
       containerWidth: availableWidth,
+      fontFamily: _config.fontFamily,
     );
 
     // 加载中状态
@@ -625,6 +626,7 @@ class _ReaderPageState extends State<ReaderPage> {
             fontSize: fontSize,
             lineHeightRatio: lineHeight,
             containerWidth: _config.containerWidth,
+            fontFamily: _config.fontFamily,
           );
           _darkMode = darkMode;
         });
@@ -733,6 +735,7 @@ class _ReaderPageState extends State<ReaderPage> {
                       fontSize: v,
                       lineHeightRatio: _config.lineHeightRatio,
                       containerWidth: _config.containerWidth,
+                      fontFamily: _config.fontFamily,
                     );
                     _saveSettings();
                   }),
@@ -756,6 +759,7 @@ class _ReaderPageState extends State<ReaderPage> {
                       fontSize: _config.fontSize,
                       lineHeightRatio: v,
                       containerWidth: _config.containerWidth,
+                      fontFamily: _config.fontFamily,
                     );
                     _saveSettings();
                   }),

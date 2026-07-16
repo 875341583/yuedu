@@ -75,6 +75,20 @@ typedef TypesetFFIDart = FFITypesetResult Function(
 typedef FreeTypesetResultNative = Void Function(FFITypesetResult result);
 typedef FreeTypesetResultDart = void Function(FFITypesetResult result);
 
+typedef SetFontPathNative = Uint8 Function(Pointer<Uint8> pathPtr, Int32 pathLen);
+typedef SetFontPathDart = int Function(Pointer<Uint8> pathPtr, int pathLen);
+
+typedef SetCharWidthsNative = Void Function(
+  Pointer<Uint32> codePointsPtr,
+  Pointer<Double> widthsPtr,
+  Int32 count,
+);
+typedef SetCharWidthsDart = void Function(
+  Pointer<Uint32> codePointsPtr,
+  Pointer<Double> widthsPtr,
+  int count,
+);
+
 // =========== Rust排版引擎FFI绑定类 ===========
 
 /// Rust排版引擎的FFI绑定
@@ -89,6 +103,8 @@ class RustTypesetEngine {
   late DynamicLibrary _lib;
   late TypesetFFIDart _typesetFFI;
   late FreeTypesetResultDart _freeTypesetResult;
+  late SetFontPathDart _setFontPath;
+  late SetCharWidthsDart _setCharWidths;
 
   bool _initialized = false;
 
@@ -111,7 +127,64 @@ class RustTypesetEngine {
         FreeTypesetResultNative,
         FreeTypesetResultDart>('free_typeset_result');
 
+    _setFontPath = _lib.lookupFunction<SetFontPathNative, SetFontPathDart>(
+      'set_font_path',
+    );
+
+    _setCharWidths = _lib.lookupFunction<SetCharWidthsNative, SetCharWidthsDart>(
+      'set_char_widths',
+    );
+
     _initialized = true;
+  }
+
+  /// 设置字符宽度表（替换全部）
+  ///
+  /// Dart 侧使用 TextPainter 预测量所有字符宽度后调用此方法，
+  /// 确保Rust引擎的度量值与渲染器完全一致。
+  ///
+  /// [widthTable] Unicode码点 → 宽度（像素）的映射表
+  void setCharWidths(Map<int, double> widthTable) {
+    _init();
+    if (!_initialized || widthTable.isEmpty) return;
+
+    using((arena) {
+      final count = widthTable.length;
+      final codePointsPtr = arena<Uint32>(count);
+      final widthsPtr = arena<Double>(count);
+      final codePoints = codePointsPtr.asTypedList(count);
+      final widths = widthsPtr.asTypedList(count);
+
+      var i = 0;
+      widthTable.forEach((codePoint, width) {
+        codePoints[i] = codePoint;
+        widths[i] = width;
+        i++;
+      });
+
+      _setCharWidths(codePointsPtr, widthsPtr, count);
+    });
+  }
+
+  /// 设置字体文件路径（次级回退）
+  ///
+  /// 在 Native 平台，调用此方法加载系统字体文件，使 Rust 引擎的
+  /// 度量结果与 Flutter TextPainter 的渲染宽度一致。
+  ///
+  /// [path] 字体文件的绝对路径（如 Windows 的 C:\Windows\Fonts\msyh.ttc）
+  /// 返回是否成功加载
+  bool setFontPath(String path) {
+    _init();
+    if (!_initialized) return false;
+
+    final utf8Bytes = utf8.encode(path);
+    final pathLen = utf8Bytes.length;
+
+    return using((arena) {
+      final pathPtr = arena<Uint8>(pathLen);
+      pathPtr.asTypedList(pathLen).setAll(0, utf8Bytes);
+      return _setFontPath(pathPtr, pathLen) != 0;
+    });
   }
 
   /// 获取平台对应的动态库路径

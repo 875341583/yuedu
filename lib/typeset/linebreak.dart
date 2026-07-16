@@ -2,13 +2,13 @@
 library;
 
 import 'cjk.dart';
+import 'font_metrics.dart';
 import 'types.dart';
 
 /// 将排版段列表分割为多行
 List<List<Segment>> breakLines(List<Segment> segments, TypesetConfig config) {
   if (segments.isEmpty) return [];
 
-  final em = config.fontSize;
   final maxWidth = config.containerWidth;
   final lines = <List<Segment>>[];
   var currentLine = <Segment>[];
@@ -33,9 +33,10 @@ List<List<Segment>> breakLines(List<Segment> segments, TypesetConfig config) {
       continue;
     }
 
+    // 精确度量：中西文间距用固定 1/4 em，字符用 TextPainter 真实宽度
     final segWidth = seg.kind == SegmentKind.cjkLatinSpacing
         ? config.fontSize * 0.25
-        : seg.widthEm * em;
+        : measureCharWidth(seg.char_, config);
 
     if (currentWidth + segWidth > maxWidth && currentLine.isNotEmpty) {
       // 超出容器宽度，需要换行

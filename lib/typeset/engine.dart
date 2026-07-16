@@ -10,22 +10,14 @@
 library;
 
 import 'cjk.dart';
+import 'font_metrics.dart';
 import 'linebreak.dart';
 import 'types.dart';
 
 export 'cjk.dart' show isCjk, isCjkPunctuation, isCompressible, Segment, SegmentKind;
+export 'font_metrics.dart' show measureCharWidth, clearCharWidthCache;
 export 'linebreak.dart' show breakLines;
 export 'types.dart' show TypesetConfig, GlyphInfo, LineInfo, TypesetResult;
-
-/// 简化的字符宽度测量
-///
-/// PoC阶段使用等价宽度表，MVP阶段替换为精确字体度量
-double measureCharWidth(String ch, TypesetConfig config) {
-  final em = config.fontSize;
-  if (isCjk(ch)) return em; // CJK字符全角
-  if (ch.codeUnitAt(0) < 128) return em * 0.5; // ASCII半角
-  return em * 0.5; // 其他半角近似
-}
 
 /// 排版引擎主入口：对一段纯文本执行排版计算
 TypesetResult typesetParagraph(String text, TypesetConfig config) {
@@ -81,14 +73,16 @@ TypesetResult typesetParagraph(String text, TypesetConfig config) {
         lineGlyphCount++;
       } else {
         final ch = seg.char_;
-        // 如果是挤压后的标点，宽度为半角
+        // 精确度量：使用 TextPainter 测量真实宽度
+        final trueWidth = measureCharWidth(ch, config);
         double width;
         bool isSqueezed = false;
         if (isCompressible(ch) && seg.widthEm == 0.5) {
-          width = config.fontSize * 0.5;
+          // 标点挤压：宽度为真实宽度的一半
+          width = trueWidth * 0.5;
           isSqueezed = true;
         } else {
-          width = measureCharWidth(ch, config);
+          width = trueWidth;
         }
 
         glyphs.add(GlyphInfo(

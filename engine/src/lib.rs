@@ -19,8 +19,23 @@ mod types;
 pub use types::*;
 pub use cjk::{Segment, SegmentKind};
 
+use std::collections::HashMap;
 use std::ffi::c_int;
 use std::slice;
+use std::sync::{Mutex, OnceLock};
+
+use ab_glyph::{Font, FontVec, ScaleFont};
+
+/// 全局字体数据（通过 set_font_path FFI 设置，作为次级回退）
+static FONT_DATA: OnceLock<Option<FontVec>> = OnceLock::new();
+
+/// 全局字符宽度表（由 Dart 侧通过 TextPainter 预测量后传入）
+static CHAR_WIDTH_TABLE: OnceLock<Mutex<HashMap<u32, f64>>> = OnceLock::new();
+
+/// 获取全局字符宽度表的引用
+fn get_width_table() -> &'static Mutex<HashMap<u32, f64>> {
+    CHAR_WIDTH_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// 排版引擎主入口：对一段纯文本执行排版计算
 ///
@@ -60,7 +75,13 @@ pub fn typeset_paragraph(text: &str, config: &TypesetConfig) -> TypesetResult {
         for seg in &squeezed {
             match &seg.kind {
                 SegmentKind::Char(ch) => {
-                    let width = measure_char_width(*ch, config);
+                    let full_width = measure_char_width(*ch, config);
+                    // 标点挤压：如果 width_em 被设为 0.5，宽度减半
+                    let width = if seg.width_em == 0.5 && cjk::is_cjk_punctuation(*ch) {
+                        full_width * 0.5
+                    } else {
+                        full_width
+                    };
                     glyphs.push(GlyphInfo {
                         char: *ch,
                         x,
@@ -94,21 +115,118 @@ pub fn typeset_paragraph(text: &str, config: &TypesetConfig) -> TypesetResult {
     TypesetResult { glyphs, lines: lines.iter().map(|l| l.len()).collect() }
 }
 
-/// 简化的字符宽度测量
+/// 精确字符宽度测量
 ///
-/// PoC阶段使用等价宽度表，MVP阶段替换为 harfbuzz/raqote 精确测量
-fn measure_char_width(ch: char, config: &TypesetConfig) -> f64 {
+/// 查表优先级：
+/// 1. Dart 侧通过 TextPainter 预测量的宽度表（最准确，与渲染器一致）
+/// 2. ab_glyph 度量（次级回退）
+/// 3. 等宽估算（最后回退）
+pub(crate) fn measure_char_width(ch: char, config: &TypesetConfig) -> f64 {
+    // 1. 查询 TextPainter 预测量表
+    if let Ok(map) = get_width_table().lock() {
+        if let Some(&width) = map.get(&(ch as u32)) {
+            return width;
+        }
+    }
+
+    // 2. 回退到 ab_glyph
+    if let Some(Some(font)) = FONT_DATA.get() {
+        let glyph_id = font.glyph_id(ch);
+        if glyph_id.0 != 0 {
+            let scaled = font.as_scaled(config.font_size as f32);
+            return scaled.h_advance(glyph_id) as f64;
+        }
+    }
+
+    // 3. 最后回退到等宽估算
     let em = config.font_size;
     if cjk::is_cjk(ch) {
-        em // CJK字符全角宽度
+        em
     } else if ch.is_ascii() {
-        em * 0.5 // ASCII字符半角宽度（等宽近似）
+        em * 0.5
     } else {
-        em * 0.5 // 其他字符半角近似
+        em * 0.5
     }
 }
 
 // =========== FFI 导出函数 ===========
+
+/// 设置字符宽度表（替换全部）
+///
+/// Dart 侧使用 TextPainter 预测量所有字符的宽度后，通过此函数
+/// 将宽度表传给 Rust 引擎，确保引擎的度量值与渲染器完全一致。
+///
+/// # 参数
+/// - `code_points_ptr`: Unicode 码点数组指针（u32[]）
+/// - `widths_ptr`: 宽度数组指针（f64[]），与码点一一对应
+/// - `count`: 数组元素个数
+///
+/// # 安全要求
+/// - 两个数组必须有效且长度为 `count`
+/// - 调用会清空之前的宽度表并替换为新数据
+#[no_mangle]
+pub unsafe extern "C" fn set_char_widths(
+    code_points_ptr: *const u32,
+    widths_ptr: *const f64,
+    count: c_int,
+) {
+    let count = count as usize;
+    let code_points = unsafe { slice::from_raw_parts(code_points_ptr, count) };
+    let widths = unsafe { slice::from_raw_parts(widths_ptr, count) };
+
+    let table = get_width_table();
+    let mut map = table.lock().unwrap();
+    map.clear();
+    for i in 0..count {
+        map.insert(code_points[i], widths[i]);
+    }
+}
+
+/// 设置字体文件路径（次级回退用）
+///
+/// # 参数
+/// - `path_ptr`: UTF-8路径字符串的指针
+/// - `path_len`: 路径字节长度
+///
+/// # 返回
+/// - 1: 成功加载字体
+/// - 0: 失败（文件不存在/解析失败）
+///
+/// # 安全要求
+/// - `path_ptr`必须指向有效的UTF-8数据，长度为`path_len`
+/// - 应在首次调用 `typeset_ffi` 之前调用
+#[no_mangle]
+pub unsafe extern "C" fn set_font_path(
+    path_ptr: *const u8,
+    path_len: c_int,
+) -> u8 {
+    let path_str = unsafe {
+        let slice = slice::from_raw_parts(path_ptr, path_len as usize);
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        }
+    };
+
+    match std::fs::read(path_str) {
+        Ok(data) => {
+            match FontVec::try_from_vec(data) {
+                Ok(font) => {
+                    let _ = FONT_DATA.set(Some(font));
+                    1
+                }
+                Err(_) => {
+                    let _ = FONT_DATA.set(None);
+                    0
+                }
+            }
+        }
+        Err(_) => {
+            let _ = FONT_DATA.set(None);
+            0
+        }
+    }
+}
 
 /// 内部排版计算，返回带详细信息的FFI结果
 ///

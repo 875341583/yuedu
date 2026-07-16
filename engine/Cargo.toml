@@ -9,3 +9,4 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [dependencies]
 unicode-segmentation = "1"
 unicode-properties = "0.1"
+ab_glyph = "0.2"

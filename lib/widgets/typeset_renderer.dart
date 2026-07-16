@@ -61,6 +61,7 @@ class _TypesetPainter extends CustomPainter {
           text: glyph.char,
           style: TextStyle(
             fontSize: config.fontSize,
+            fontFamily: config.fontFamily,
             color: glyph.isSqueezed ? textColor.withOpacity(0.6) : textColor,
             height: config.lineHeightRatio,
           ),

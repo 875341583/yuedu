@@ -41,13 +41,11 @@ pub fn break_lines(segments: &[Segment], config: &TypesetConfig) -> Vec<Vec<Segm
             continue;
         }
 
-        let seg_width = seg.width_em * config.font_size;
-
-        // 中西文间距段宽度
-        let width = if let SegmentKind::CjkLatinSpacing = seg.kind {
-            config.font_size * 0.25
-        } else {
-            seg_width
+        // 精确度量：字符用 ab_glyph 真实宽度，中西文间距用固定 1/4 em
+        let width = match &seg.kind {
+            SegmentKind::Char(ch) => crate::measure_char_width(*ch, config),
+            SegmentKind::CjkLatinSpacing => config.font_size * 0.25,
+            SegmentKind::LineBreak => 0.0,
         };
 
         if current_width + width > max_width && !current_line.is_empty() {
