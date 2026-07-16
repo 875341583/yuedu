@@ -23,14 +23,9 @@ class TypesetRendererWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       width: config.containerWidth,
-      decoration: BoxDecoration(
-        border: Border.all(color: bgColor.withOpacity(0.2)),
-        borderRadius: BorderRadius.circular(4),
-        color: bgColor,
-      ),
-      padding: const EdgeInsets.all(16),
+      color: bgColor,
       child: CustomPaint(
-        size: Size(config.containerWidth - 32, result.totalHeight),
+        size: Size(config.containerWidth, result.totalHeight),
         painter: _TypesetPainter(result: result, config: config, textColor: textColor),
       ),
     );
