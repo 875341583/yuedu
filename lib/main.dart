@@ -7,24 +7,22 @@ import 'services/bookshelf_service.dart';
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
-  
-  // 调试模式：通过命令行参数 --open-book=书名 直接打开某本书
+
+  // 命令行参数 --open-book=书名：直接打开某本书（支持桌面快捷方式/深链接）
   String? openBookTitle;
   for (final arg in args) {
     if (arg.startsWith('--open-book=')) {
       openBookTitle = arg.substring('--open-book='.length);
     }
   }
-  
-  try {
-    await BookshelfService.instance.loadFromStorage();
-  } catch (_) {}
-  
+
+  await BookshelfService.instance.loadFromStorage();
   runApp(YueDuApp(openBookTitle: openBookTitle));
 }
 
 class YueDuApp extends StatelessWidget {
   final String? openBookTitle;
+
   const YueDuApp({super.key, this.openBookTitle});
 
   @override

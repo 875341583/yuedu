@@ -8,10 +8,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart';
 
 import '../models/book.dart';
+import '../models/bookmark.dart';
 import '../services/bookshelf_service.dart';
+import '../services/bookmark_service.dart';
 import '../typeset/types.dart';
 import '../typeset/typeset_engine_provider.dart';
+import '../utils/chapter_parser.dart';
 import '../widgets/typeset_renderer.dart';
+import '../widgets/toc_bookmark_panel.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ─── 阅读主题定义 ───────────────────────────────────────────
@@ -176,6 +180,13 @@ class _ReaderPageState extends State<ReaderPage> {
   /// 拖拽进度时临时值（null=未在拖拽）
   double? _seekProgress;
 
+  /// 书签列表
+  List<Bookmark> _bookmarks = [];
+
+  /// 是否正在解析章节
+  bool _isParsingChapters = false;
+
+  // ignore: unused_field
   /// 当前引擎类型
   final String _engineName = TypesetEngineProvider.engineName;
 
@@ -201,6 +212,54 @@ class _ReaderPageState extends State<ReaderPage> {
     super.initState();
     _loadSettings();
     _loadContent();
+    _loadBookmarks();
+    _ensureChapters();
+  }
+
+  /// 加载书签
+  Future<void> _loadBookmarks() async {
+    await BookmarkService.instance.loadFromStorage();
+    if (mounted) {
+      setState(() {
+        _bookmarks = BookmarkService.instance.getBookmarksForBook(widget.book.id);
+      });
+    }
+  }
+
+  /// 确保章节已解析（首次打开时触发）
+  Future<void> _ensureChapters() async {
+    if (widget.book.chapters.isNotEmpty || _isParsingChapters) return;
+
+    // EPUB格式在readContent时已解析章节
+    if (widget.book.format == BookFormat.epub) return;
+
+    _isParsingChapters = true;
+    try {
+      final service = BookshelfService.instance;
+      final isLarge = await service.isLargeFile(widget.book);
+
+      List<Chapter> chapters;
+      if (isLarge) {
+        // 大文件：窗口扫描
+        chapters = await ChapterParser.parseLargeFile(
+          readWindow: (offset, length) =>
+              service.readTextWindow(widget.book, offset, length),
+          totalBytes: await service.getBookFileSize(widget.book),
+        );
+      } else {
+        // 小文件：全文解析
+        final content = await service.readContent(widget.book);
+        chapters = ChapterParser.parse(content);
+      }
+
+      if (chapters.isNotEmpty && mounted) {
+        widget.book.chapters = chapters;
+        BookshelfService.instance.updateChapters(widget.book.id, chapters);
+        setState(() {});
+      }
+    } catch (_) {} finally {
+      _isParsingChapters = false;
+    }
   }
 
   @override
@@ -423,7 +482,23 @@ class _ReaderPageState extends State<ReaderPage> {
                   event.logicalKey == LogicalKeyboardKey.pageUp) {
                 _prevPage();
               } else if (event.logicalKey == LogicalKeyboardKey.escape) {
-                Navigator.of(context).pop();
+                if (_showMenu) {
+                  setState(() { _showMenu = false; _showSettings = false; });
+                } else {
+                  Navigator.of(context).pop();
+                }
+              } else if (event.logicalKey == LogicalKeyboardKey.keyM) {
+                // M键：切换菜单
+                setState(() {
+                  _showMenu = !_showMenu;
+                  if (!_showMenu) _showSettings = false;
+                });
+              } else if (event.logicalKey == LogicalKeyboardKey.keyT) {
+                // T键：打开目录与书签面板
+                _showTocBookmarkPanel();
+              } else if (event.logicalKey == LogicalKeyboardKey.keyB) {
+                // B键：切换书签
+                _toggleBookmark();
               }
             }
           },
@@ -678,6 +753,117 @@ class _ReaderPageState extends State<ReaderPage> {
     }
   }
 
+  // ─── 目录与书签 ──────────────────────────────────────────
+
+  /// 当前位置是否有书签
+  bool get _hasBookmarkAtCurrent {
+    final pos = _isLargeFile ? _byteOffset : _offset;
+    return BookmarkService.instance.hasBookmarkNear(widget.book.id, pos);
+  }
+
+  /// 获取当前位置的阅读预览文本
+  String get _currentPreview {
+    if (_currentPage != null && _currentPage!.result.glyphs.isNotEmpty) {
+      final glyphs = _currentPage!.result.glyphs
+          .where((g) => !g.isCjkLatinSpacing && g.char != '\n');
+      final chars = glyphs.take(40).map((g) => g.char).join();
+      return chars.isEmpty ? '（空白页）' : chars;
+    }
+    return '位置 ${_isLargeFile ? _byteOffset : _offset}';
+  }
+
+  /// 添加/移除当前页书签
+  Future<void> _toggleBookmark() async {
+    final pos = _isLargeFile ? _byteOffset : _offset;
+    final existing = BookmarkService.instance.getBookmarksForBook(widget.book.id);
+    final near = existing.where((b) => (b.position - pos).abs() < 100);
+
+    if (near.isNotEmpty) {
+      // 移除已有书签
+      await BookmarkService.instance.removeBookmark(near.first.id);
+    } else {
+      // 添加新书签
+      await BookmarkService.instance.addBookmark(
+        bookId: widget.book.id,
+        position: pos,
+        preview: _currentPreview,
+      );
+    }
+
+    if (mounted) {
+      setState(() {
+        _bookmarks = BookmarkService.instance.getBookmarksForBook(widget.book.id);
+      });
+    }
+  }
+
+  /// 显示目录与书签面板
+  void _showTocBookmarkPanel() {
+    final pos = _isLargeFile ? _byteOffset : _offset;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => TocBookmarkPanel(
+        book: widget.book,
+        chapters: widget.book.chapters,
+        bookmarks: _bookmarks,
+        currentPosition: pos,
+        isLargeFile: _isLargeFile,
+        onJump: _jumpToChapter,
+        onAddBookmark: () async {
+          await _toggleBookmark();
+        },
+        onRemoveBookmark: (id) async {
+          await BookmarkService.instance.removeBookmark(id);
+          if (mounted) {
+            setState(() {
+              _bookmarks = BookmarkService.instance.getBookmarksForBook(widget.book.id);
+            });
+          }
+        },
+        bgColor: _theme.bg,
+        textColor: _theme.text,
+        hintColor: _theme.hint,
+        surfaceColor: _theme.surface,
+        borderColor: _theme.border,
+        isDark: _theme.isDark,
+      ),
+    );
+  }
+
+  /// 跳转到章节/书签位置
+  Future<void> _jumpToChapter(int targetOffset) async {
+    _pageDirection = 1;
+
+    if (_isLargeFile) {
+      // 大文件：targetOffset 是字符偏移，需转换为字节偏移
+      // 章节解析时用的是全文扫描，startOffset是字符近似值
+      // 估算：字符偏移 / 总字符数 * 总字节数
+      if (_totalChars > 0 && _totalBytes > 0) {
+        final byteTarget = (targetOffset / _totalChars * _totalBytes).floor()
+            .clamp(0, _totalBytes - 1);
+        setState(() => _isPaging = true);
+        try {
+          _byteOffset = byteTarget;
+          _textWindow = await BookshelfService.instance
+              .readTextWindow(widget.book, _byteOffset, _windowBytes);
+          _offset = 0;
+          if (mounted) setState(() => _isPaging = false);
+          _savePosition();
+        } catch (_) {
+          if (mounted) setState(() => _isPaging = false);
+        }
+      }
+    } else {
+      // 小文件：直接字符偏移跳转
+      setState(() {
+        _offset = targetOffset.clamp(0, _totalChars - 1);
+      });
+      _savePosition();
+    }
+  }
+
   // ─── 读写位置 & 设置持久化 ────────────────────────────────
 
   void _savePosition() {
@@ -786,6 +972,11 @@ class _ReaderPageState extends State<ReaderPage> {
               onPressed: () => Navigator.of(context).pop(),
               tooltip: '返回',
             ),
+            IconButton(
+              icon: Icon(Icons.menu_book_outlined, color: _theme.text, size: 20),
+              onPressed: _showTocBookmarkPanel,
+              tooltip: '目录与书签',
+            ),
             Expanded(
               child: Text(
                 widget.book.title,
@@ -795,16 +986,15 @@ class _ReaderPageState extends State<ReaderPage> {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: Colors.indigo.withOpacity(_theme.isDark ? 0.2 : 0.08),
-                borderRadius: BorderRadius.circular(8),
+            // 书签按钮
+            IconButton(
+              icon: Icon(
+                _hasBookmarkAtCurrent ? Icons.bookmark : Icons.bookmark_border,
+                color: _hasBookmarkAtCurrent ? Colors.amber.shade600 : _theme.text,
+                size: 20,
               ),
-              child: Text(
-                _engineName,
-                style: TextStyle(fontSize: 10, color: Colors.indigo.shade300, fontWeight: FontWeight.w600),
-              ),
+              onPressed: _toggleBookmark,
+              tooltip: _hasBookmarkAtCurrent ? '移除书签' : '添加书签',
             ),
             IconButton(
               icon: Icon(

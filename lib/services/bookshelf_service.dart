@@ -444,6 +444,15 @@ class BookshelfService {
     }
   }
 
+  /// 更新书籍章节列表并持久化
+  void updateChapters(String bookId, List<Chapter> chapters) {
+    final idx = _books.indexWhere((b) => b.id == bookId);
+    if (idx >= 0) {
+      _books[idx].chapters = chapters;
+      _saveToStorage();
+    }
+  }
+
   /// 合并种子书籍：检查预期书籍是否已在书库中，缺失的自动补上
   void _mergeSeedBooks() {
     final existingIds = _books.map((b) => b.id).toSet();
