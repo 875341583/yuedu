@@ -10,6 +10,7 @@ import '../models/book.dart';
 import '../services/bookshelf_service.dart';
 import '../utils/encoding.dart';
 import 'reader_page.dart';
+import 'pdf_reader_page.dart';
 
 class BookshelfPage extends StatefulWidget {
   const BookshelfPage({super.key});
@@ -104,10 +105,13 @@ class _BookshelfPageState extends State<BookshelfPage> {
   }
 
   void _openBook(Book book) {
+    // PDF 走独立的页面渲染阅读页（pdfrx/PDFium）
+    // 其他格式走排版引擎阅读页
+    final page = book.format == BookFormat.pdf
+        ? PdfReaderPage(book: book)
+        : ReaderPage(book: book);
     Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ReaderPage(book: book),
-      ),
+      MaterialPageRoute(builder: (_) => page),
     );
   }
 

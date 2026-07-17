@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import 'pages/bookshelf_page.dart';
 import 'pages/reader_page.dart';
+import 'pages/pdf_reader_page.dart';
+import 'models/book.dart';
 import 'services/bookshelf_service.dart';
 
 void main(List<String> args) async {
@@ -43,7 +45,10 @@ class YueDuApp extends StatelessWidget {
         (b) => b.title == openBookTitle,
         orElse: () => books.first,
       );
-      return ReaderPage(book: book);
+      // PDF 走页面渲染阅读页，其他走排版阅读页
+      return book.format == BookFormat.pdf
+          ? PdfReaderPage(book: book)
+          : ReaderPage(book: book);
     }
     return const BookshelfPage();
   }

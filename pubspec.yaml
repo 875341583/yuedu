@@ -39,6 +39,7 @@ dependencies:
   shared_preferences: ^2.5.3
   gbk_codec: ^0.4.0
   archive: ^4.0.0
+  pdfrx: ^1.0.101
 
 dev_dependencies:
   flutter_test:
