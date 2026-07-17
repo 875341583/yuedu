@@ -104,6 +104,21 @@ typedef ExtractPdfTextDart = Pointer<Uint8> Function(
 typedef FreePdfTextNative = Void Function(Pointer<Uint8> ptr, Int32 len);
 typedef FreePdfTextDart = void Function(Pointer<Uint8> ptr, int len);
 
+// MOBI文本提取FFI签名
+typedef ExtractMobiTextNative = Pointer<Uint8> Function(
+  Pointer<Uint8> pathPtr,
+  Int32 pathLen,
+  Pointer<Int32> outLenPtr,
+);
+typedef ExtractMobiTextDart = Pointer<Uint8> Function(
+  Pointer<Uint8> pathPtr,
+  int pathLen,
+  Pointer<Int32> outLenPtr,
+);
+
+typedef FreeMobiTextNative = Void Function(Pointer<Uint8> ptr, Int32 len);
+typedef FreeMobiTextDart = void Function(Pointer<Uint8> ptr, int len);
+
 // =========== Rust排版引擎FFI绑定类 ===========
 
 /// Rust排版引擎的FFI绑定
@@ -122,6 +137,8 @@ class RustTypesetEngine {
   late SetCharWidthsDart _setCharWidths;
   late ExtractPdfTextDart _extractPdfText;
   late FreePdfTextDart _freePdfText;
+  late ExtractMobiTextDart _extractMobiText;
+  late FreeMobiTextDart _freeMobiText;
 
   bool _initialized = false;
 
@@ -158,6 +175,14 @@ class RustTypesetEngine {
 
     _freePdfText = _lib.lookupFunction<FreePdfTextNative, FreePdfTextDart>(
       'free_pdf_text',
+    );
+
+    _extractMobiText = _lib.lookupFunction<ExtractMobiTextNative, ExtractMobiTextDart>(
+      'extract_mobi_text',
+    );
+
+    _freeMobiText = _lib.lookupFunction<FreeMobiTextNative, FreeMobiTextDart>(
+      'free_mobi_text',
     );
 
     _initialized = true;
@@ -363,6 +388,37 @@ class RustTypesetEngine {
 
       // 释放Rust侧分配的内存
       _freePdfText(textPtr, textLen);
+
+      return text;
+    });
+  }
+
+  /// 从MOBI文件提取全部文本
+  ///
+  /// [filePath] MOBI文件的绝对路径
+  /// 返回提取的文本内容（HTML已去标签），失败返回null
+  String? extractMobiText(String filePath) {
+    _init();
+    if (!_initialized) return null;
+
+    final pathBytes = utf8.encode(filePath);
+    final pathLen = pathBytes.length;
+
+    return using((arena) {
+      final pathPtr = arena<Uint8>(pathLen);
+      pathPtr.asTypedList(pathLen).setAll(0, pathBytes);
+      final outLenPtr = arena<Int32>();
+
+      final textPtr = _extractMobiText(pathPtr, pathLen, outLenPtr);
+      if (textPtr == nullptr) {
+        return null;
+      }
+
+      final textLen = outLenPtr.value;
+      final text = utf8.decode(textPtr.asTypedList(textLen), allowMalformed: true);
+
+      // 释放Rust侧分配的内存
+      _freeMobiText(textPtr, textLen);
 
       return text;
     });

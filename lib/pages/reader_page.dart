@@ -230,8 +230,8 @@ class _ReaderPageState extends State<ReaderPage> {
   Future<void> _ensureChapters() async {
     if (widget.book.chapters.isNotEmpty || _isParsingChapters) return;
 
-    // EPUB/PDF格式在readContent时已解析章节
-    if (widget.book.format == BookFormat.epub || widget.book.format == BookFormat.pdf) return;
+    // EPUB/PDF/MOBI格式在readContent时已解析章节
+    if (widget.book.format == BookFormat.epub || widget.book.format == BookFormat.pdf || widget.book.format == BookFormat.mobi) return;
 
     _isParsingChapters = true;
     try {

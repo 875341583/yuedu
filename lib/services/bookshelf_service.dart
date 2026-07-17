@@ -10,6 +10,7 @@ import '../models/book.dart';
 import '../utils/encoding.dart';
 import 'epub_parser.dart' deferred as epub;
 import 'pdf_parser.dart';
+import 'mobi_parser.dart';
 import 'file_service.dart';
 
 /// 书库服务（单例）
@@ -69,8 +70,12 @@ class BookshelfService {
           final list = jsonDecode(booksJson) as List;
           _books.clear();
           for (final item in list) {
-            final book = Book.fromMap(item as Map<String, dynamic>);
-            _books.add(book);
+            try {
+              final book = Book.fromMap(item as Map<String, dynamic>);
+              _books.add(book);
+            } catch (_) {
+              // 单本书反序列化失败不影响其他书
+            }
           }
         } catch (_) {}
       }
@@ -221,6 +226,29 @@ class BookshelfService {
     return book;
   }
 
+  /// 导入本地MOBI文件（Native平台）
+  Future<Book?> importMobi(String filePath) async {
+    final exists = await FileService.fileExists(filePath);
+    if (!exists) return null;
+
+    final fileName = FileService.getFileName(filePath);
+    final title = fileName.replaceAll(RegExp(r'\.\w+$'), '');
+
+    final book = Book(
+      id: 'book_${DateTime.now().millisecondsSinceEpoch}',
+      title: title,
+      author: '未知',
+      filePath: filePath,
+      format: BookFormat.mobi,
+      colorSeed: title.hashCode & 0xFFFF,
+    );
+
+    _books.add(book);
+    _saveToStorage();
+    _notifyListeners();
+    return book;
+  }
+
   /// 大文件阈值（字节）：超过此值则按需读取，不一次性加载全文
   static const _largeFileThreshold = 500 * 1024; // 500KB
 
@@ -236,6 +264,9 @@ class BookshelfService {
   /// PDF解析结果缓存：bookId → 解析结果
   final Map<String, dynamic> _pdfCache = {};
 
+  /// MOBI解析结果缓存：bookId → 解析结果
+  final Map<String, dynamic> _mobiCache = {};
+
   /// 读取书籍全部文本内容（仅用于小文件和EPUB/PDF）
   Future<String> readContent(Book book) async {
     // EPUB格式：用EPUB解析器
@@ -246,6 +277,11 @@ class BookshelfService {
     // PDF格式：用PDF解析器
     if (book.format == BookFormat.pdf) {
       return _readPdfContent(book);
+    }
+
+    // MOBI格式：用MOBI解析器
+    if (book.format == BookFormat.mobi) {
+      return _readMobiContent(book);
     }
 
     // 先检查内存缓存
@@ -386,12 +422,61 @@ class BookshelfService {
     return _pdfCache[book.id];
   }
 
+  /// 读取MOBI书籍内容
+  Future<String> _readMobiContent(Book book) async {
+    // 检查MOBI缓存
+    if (_mobiCache.containsKey(book.id)) {
+      return (_mobiCache[book.id] as dynamic).fullText as String;
+    }
+
+    // 检查文本缓存
+    if (_contentCache.containsKey(book.id)) {
+      return _contentCache[book.id]!;
+    }
+
+    if (book.filePath.isEmpty) return '';
+
+    final exists = await FileService.fileExists(book.filePath);
+    if (!exists) return '';
+
+    try {
+      final mobiBook = await MobiParser.parse(book.filePath);
+      if (mobiBook == null) return '';
+
+      _mobiCache[book.id] = mobiBook;
+
+      // 更新章节信息
+      if (book.chapters.isEmpty) {
+        book.chapters = mobiBook.chapters;
+        _saveToStorage();
+      }
+
+      // 缓存全文
+      _contentCache[book.id] = mobiBook.fullText;
+
+      return mobiBook.fullText;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /// 获取MOBI解析结果
+  Future<dynamic> getMobiBook(Book book) async {
+    if (book.format != BookFormat.mobi) return null;
+    if (_mobiCache.containsKey(book.id)) {
+      return _mobiCache[book.id];
+    }
+    await _readMobiContent(book);
+    return _mobiCache[book.id];
+  }
+
   /// 判断书籍是否为大文件（需要按需加载）
-  /// EPUB和PDF文件不按字节窗口加载，解析后全文在内存中
+  /// EPUB、PDF和MOBI文件不按字节窗口加载，解析后全文在内存中
   Future<bool> isLargeFile(Book book) async {
     if (book.filePath.isEmpty) return false;
     if (book.format == BookFormat.epub) return false;
     if (book.format == BookFormat.pdf) return false;
+    if (book.format == BookFormat.mobi) return false;
     final size = await getBookFileSize(book);
     return size >= _largeFileThreshold;
   }
@@ -547,6 +632,7 @@ class BookshelfService {
         ('长夜余火', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\《长夜余火》（校对版全本）作者：爱潜水的乌贼.txt', BookFormat.txt),
         ('收获文学榜2019-2021', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\《收获文学榜中短篇小说2019-2021合辑》（年度大合辑5册） (《收获》文学杂志社编) .epub', BookFormat.epub),
         ('31B爆改1T深度调研', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\31B爆改1T_深度调研报告.pdf', BookFormat.pdf),
+        ('Pride and Prejudice (MOBI)', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\test_book.mobi', BookFormat.mobi),
       ];
       for (final (title, path, format) in realBooks) {
         final id = 'real_${title.hashCode}';

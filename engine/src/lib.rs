@@ -423,6 +423,148 @@ pub unsafe extern "C" fn free_pdf_text(ptr: *mut u8, len: c_int) {
     unsafe { std::alloc::dealloc(ptr, layout); }
 }
 
+// =========== MOBI 文本提取 FFI ===========
+
+/// 从MOBI文件中提取全部文本（HTML去标签后的纯文本）
+///
+/// # 参数
+/// - `path_ptr`: UTF-8文件路径的指针
+/// - `path_len`: 路径字节长度
+/// - `out_len_ptr`: 输出文本长度的指针（字节，不含末尾\0）
+///
+/// # 返回
+/// - 非空指针: 成功，指向UTF-8文本（以\0结尾），长度通过out_len_ptr写出
+/// - 空指针: 失败
+///
+/// # 安全要求
+/// - `path_ptr`必须指向有效的UTF-8数据，长度为`path_len`
+/// - `out_len_ptr`必须指向有效的c_int可写内存
+/// - 调用方必须在使用完毕后调用`free_mobi_text`释放内存
+#[no_mangle]
+pub unsafe extern "C" fn extract_mobi_text(
+    path_ptr: *const u8,
+    path_len: c_int,
+    out_len_ptr: *mut c_int,
+) -> *mut u8 {
+    let path_str = unsafe {
+        let slice = slice::from_raw_parts(path_ptr, path_len as usize);
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+
+    let m = match mobi::Mobi::from_path(path_str) {
+        Ok(m) => m,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    // MOBI内容是HTML，需要去除标签转换为纯文本
+    // 很多MOBI文件使用Windows-1252编码，content_as_string_lossy可处理非UTF-8
+    let html = m.content_as_string_lossy();
+    let text = strip_html_to_text(&html);
+
+    let text_bytes = text.as_bytes();
+    let total_len = text_bytes.len();
+
+    let layout = std::alloc::Layout::from_size_align(total_len + 1, 1).unwrap();
+    let buf = unsafe { std::alloc::alloc(layout) };
+    if buf.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(text_bytes.as_ptr(), buf, total_len);
+        *buf.add(total_len) = 0;
+        *out_len_ptr = total_len as c_int;
+    }
+
+    buf
+}
+
+/// 释放extract_mobi_text返回的文本内存
+#[no_mangle]
+pub unsafe extern "C" fn free_mobi_text(ptr: *mut u8, len: c_int) {
+    if ptr.is_null() { return; }
+    let total = (len as usize) + 1;
+    let layout = std::alloc::Layout::from_size_align(total, 1).unwrap();
+    unsafe { std::alloc::dealloc(ptr, layout); }
+}
+
+/// 简单HTML转纯文本：去除标签、解码常见实体、保留段落分隔
+fn strip_html_to_text(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut tag_name = String::new();
+    let mut collecting_tag = false;
+
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                collecting_tag = true;
+                tag_name.clear();
+            }
+            '>' => {
+                in_tag = false;
+                collecting_tag = false;
+                // 块级元素后加换行
+                let tag_lower = tag_name.to_lowercase();
+                if tag_lower.starts_with("p")
+                    || tag_lower.starts_with("div")
+                    || (tag_lower.starts_with("h") && tag_lower.len() <= 2)
+                    || tag_lower == "br"
+                    || tag_lower == "li"
+                    || tag_lower == "tr"
+                {
+                    result.push('\n');
+                }
+                tag_name.clear();
+            }
+            _ if in_tag => {
+                if collecting_tag {
+                    if ch.is_whitespace() || ch == '/' {
+                        collecting_tag = false;
+                    } else {
+                        tag_name.push(ch.to_ascii_lowercase());
+                    }
+                }
+            }
+            _ if !in_tag => {
+                result.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    // 解码常见HTML实体
+    let result = result
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'");
+
+    // 清理连续空行（最多保留2个换行）
+    let mut cleaned = String::with_capacity(result.len());
+    let mut newline_count = 0;
+    for ch in result.chars() {
+        if ch == '\n' {
+            newline_count += 1;
+            if newline_count <= 2 {
+                cleaned.push(ch);
+            }
+        } else {
+            newline_count = 0;
+            cleaned.push(ch);
+        }
+    }
+
+    cleaned.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

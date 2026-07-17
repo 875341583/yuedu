@@ -115,4 +115,5 @@ enum BookFormat {
   txt,
   epub,
   pdf,
+  mobi,
 }

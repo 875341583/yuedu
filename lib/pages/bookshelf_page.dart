@@ -43,7 +43,7 @@ class _BookshelfPageState extends State<BookshelfPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('阅界'),
+        title: Text('阅界${books.length > 0 ? " (${books.length})" : ""}'),
         centerTitle: true,
         actions: [
           IconButton(
@@ -80,19 +80,22 @@ class _BookshelfPageState extends State<BookshelfPage> {
   }
 
   Widget _buildBookGrid(List<Book> books) {
-    return GridView.builder(
-      padding: const EdgeInsets.all(16),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 3,
-        childAspectRatio: 0.65,
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-      ),
-      itemCount: books.length,
-      itemBuilder: (context, index) => _BookCard(
-        book: books[index],
-        onTap: () => _openBook(books[index]),
-        onLongPress: () => _deleteBook(books[index]),
+    return Scrollbar(
+      thumbVisibility: true,
+      child: GridView.builder(
+        padding: const EdgeInsets.all(16),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          childAspectRatio: 0.62,
+          crossAxisSpacing: 12,
+          mainAxisSpacing: 12,
+        ),
+        itemCount: books.length,
+        itemBuilder: (context, index) => _BookCard(
+          book: books[index],
+          onTap: () => _openBook(books[index]),
+          onLongPress: () => _deleteBook(books[index]),
+        ),
       ),
     );
   }
@@ -109,7 +112,7 @@ class _BookshelfPageState extends State<BookshelfPage> {
   Future<void> _importFromFile() async {
     final result = await FilePicker.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['txt', 'epub', 'pdf'],
+      allowedExtensions: ['txt', 'epub', 'pdf', 'mobi'],
       allowMultiple: true,
     );
 
@@ -122,11 +125,14 @@ class _BookshelfPageState extends State<BookshelfPage> {
         final path = pickedFile.path!;
         final isEpub = path.toLowerCase().endsWith('.epub');
         final isPdf = path.toLowerCase().endsWith('.pdf');
-        final book = isPdf
-            ? await _service.importPdf(path)
-            : isEpub
-                ? await _service.importEpub(path)
-                : await _service.importTxt(path);
+        final isMobi = path.toLowerCase().endsWith('.mobi');
+        final book = isMobi
+            ? await _service.importMobi(path)
+            : isPdf
+                ? await _service.importPdf(path)
+                : isEpub
+                    ? await _service.importEpub(path)
+                    : await _service.importTxt(path);
         if (book != null && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('已导入: ${book.title}'), duration: const Duration(seconds: 2)),
@@ -243,7 +249,7 @@ class _BookCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
-                  book.format == BookFormat.txt ? 'TXT' : book.format == BookFormat.epub ? 'EPUB' : 'PDF',
+                  book.format == BookFormat.txt ? 'TXT' : book.format == BookFormat.epub ? 'EPUB' : book.format == BookFormat.pdf ? 'PDF' : 'MOBI',
                   style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 10),
                 ),
               ),
