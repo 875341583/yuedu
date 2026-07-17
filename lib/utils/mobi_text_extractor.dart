@@ -53,21 +53,45 @@ class MobiTextExtractor {
     }
 
     // --- PalmDOC header (first 16 bytes of record 0) ---
+    // Layout (big-endian, per PalmDOC/MOBI spec):
+    //   offset 0  (2B): compression (0=none, 1=PalmDoc RLE, 2=Huffman)
+    //   offset 2  (2B): unused
+    //   offset 4  (4B): textLength (uncompressed total text bytes)
+    //   offset 8  (2B): recordCount (number of text records)
+    //   offset 10 (2B): recordSize (max 4096)
+    //   offset 12 (2B): encryptionType (0=none, 1=old, 2=DRM)
     final rec0Start = offsets[0];
     final rec0End = offsets[1];
     if (rec0End - rec0Start < 16) {
       throw MobiExtractException('PalmDOC头过短');
     }
 
-    final compression = _beUint32(bytes, rec0Start);
-    final textLength = _beUint32(bytes, rec0Start + 8);
-    final recordCount = _beUint16(bytes, rec0Start + 12);
+    final compression = _beUint16(bytes, rec0Start);
+    final textLength = _beUint32(bytes, rec0Start + 4);
+    final recordCount = _beUint16(bytes, rec0Start + 8);
+    final encryption = _beUint16(bytes, rec0Start + 12);
+
+    // Encryption check — DRM-protected files cannot be decoded
+    if (encryption != 0) {
+      throw MobiExtractException(
+          'MOBI文件已加密（encryption=$encryption），不支持DRM保护文件');
+    }
 
     // Only PalmDOC RLE (1) and no compression (0) are supported.
     // Huffman (2) is too complex; anything else is unknown.
     if (compression != 0 && compression != 1) {
       throw MobiExtractException(
           '不支持的MOBI压缩类型（compression=$compression，仅支持0=无压缩/1=PalmDOC RLE）');
+    }
+
+    // --- MOBI header (optional, at offset 16 of record 0) ---
+    // If present, read textEncoding (0=CP1252, 65001=UTF-8) at offset 28.
+    int? mobiTextEncoding;
+    final mobiMagic = rec0End - rec0Start >= 20
+        ? String.fromCharCodes(bytes.sublist(rec0Start + 16, rec0Start + 20))
+        : '';
+    if (mobiMagic == 'MOBI' && rec0End - rec0Start >= 32) {
+      mobiTextEncoding = _beUint32(bytes, rec0Start + 28);
     }
 
     // --- Decompress text records (record 1 .. N) ---
@@ -99,7 +123,9 @@ class MobiTextExtractor {
     }
 
     if (decompressed.isEmpty) {
-      throw MobiExtractException('MOBI解压后内容为空');
+      throw MobiExtractException(
+          'MOBI解压后内容为空（compression=$compression, recordCount=$recordCount, '
+          'numRecords=$numRecords, textLength=$textLength）');
     }
 
     // Truncate to declared text length
@@ -111,13 +137,22 @@ class MobiTextExtractor {
     }
 
     // --- Decode bytes ---
+    // Prefer MOBI header's textEncoding if available; otherwise auto-detect.
     // MOBI text encoding is usually UTF-8 (65001) or CP1252 (1252).
-    // Try strict UTF-8 first, then fall back to CP1252.
     String raw;
-    try {
-      raw = utf8.decode(textBytes, allowMalformed: false);
-    } catch (_) {
+    if (mobiTextEncoding == 65001) {
+      // Explicit UTF-8
+      raw = utf8.decode(textBytes, allowMalformed: true);
+    } else if (mobiTextEncoding == 1252 || mobiTextEncoding == 0) {
+      // Explicit CP1252
       raw = _decodeCp1252(textBytes);
+    } else {
+      // Auto-detect: try strict UTF-8 first, then fall back to CP1252
+      try {
+        raw = utf8.decode(textBytes, allowMalformed: false);
+      } catch (_) {
+        raw = _decodeCp1252(textBytes);
+      }
     }
 
     // --- Strip HTML tags ---
