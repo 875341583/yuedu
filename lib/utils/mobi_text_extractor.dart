@@ -14,29 +14,32 @@ import 'dart:typed_data';
 /// Extracts text content from a MOBI file using pure Dart (no FFI).
 class MobiTextExtractor {
   /// Extract all text from [filePath].
-  /// Returns null if extraction fails; empty string if no text was found.
+  /// Returns the extracted text, or null if no text was found.
+  /// Throws [MobiExtractException] with a diagnostic message on parse errors.
   static String? extract(String filePath) {
-    try {
-      final bytes = File(filePath).readAsBytesSync();
-      return _extractFromBytes(bytes);
-    } catch (_) {
-      return null;
-    }
+    final bytes = File(filePath).readAsBytesSync();
+    return _extractFromBytes(bytes);
   }
 
   static String? _extractFromBytes(Uint8List bytes) {
-    if (bytes.length < 78) return null;
+    if (bytes.length < 78) {
+      throw MobiExtractException('文件太小，不是有效的MOBI（$bytes.length字节）');
+    }
 
     // --- PDB header ---
     // numRecords at offset 76 (2 bytes big-endian)
     final numRecords = _beUint16(bytes, 76);
-    if (numRecords < 2) return null; // record 0 = header + at least 1 text record
+    if (numRecords < 2) {
+      throw MobiExtractException('MOBI记录数异常（numRecords=$numRecords）');
+    }
 
     // Record info entries start at offset 78, each 8 bytes (4 offset + 1 attr + 3 uid)
     final offsets = <int>[];
     for (var i = 0; i < numRecords; i++) {
       final off = 78 + i * 8;
-      if (off + 4 > bytes.length) return null;
+      if (off + 4 > bytes.length) {
+        throw MobiExtractException('PDB头偏移表越界');
+      }
       offsets.add(_beUint32(bytes, off));
     }
     // Sentinel: last record extends to end of file
@@ -44,13 +47,17 @@ class MobiTextExtractor {
 
     // Validate offsets are sorted and within file bounds
     for (final o in offsets) {
-      if (o < 0 || o > bytes.length) return null;
+      if (o < 0 || o > bytes.length) {
+        throw MobiExtractException('PDB偏移越界（offset=$o, fileSize=$bytes.length）');
+      }
     }
 
     // --- PalmDOC header (first 16 bytes of record 0) ---
     final rec0Start = offsets[0];
     final rec0End = offsets[1];
-    if (rec0End - rec0Start < 16) return null;
+    if (rec0End - rec0Start < 16) {
+      throw MobiExtractException('PalmDOC头过短');
+    }
 
     final compression = _beUint32(bytes, rec0Start);
     final textLength = _beUint32(bytes, rec0Start + 8);
@@ -58,7 +65,10 @@ class MobiTextExtractor {
 
     // Only PalmDOC RLE (1) and no compression (0) are supported.
     // Huffman (2) is too complex; anything else is unknown.
-    if (compression != 0 && compression != 1) return null;
+    if (compression != 0 && compression != 1) {
+      throw MobiExtractException(
+          '不支持的MOBI压缩类型（compression=$compression，仅支持0=无压缩/1=PalmDOC RLE）');
+    }
 
     // --- Decompress text records (record 1 .. N) ---
     // Use the declared recordCount when available, else fall back to all
@@ -88,7 +98,9 @@ class MobiTextExtractor {
       if (textLength > 0 && decompressed.length >= textLength) break;
     }
 
-    if (decompressed.isEmpty) return null;
+    if (decompressed.isEmpty) {
+      throw MobiExtractException('MOBI解压后内容为空');
+    }
 
     // Truncate to declared text length
     List<int> textBytes;
@@ -110,7 +122,10 @@ class MobiTextExtractor {
 
     // --- Strip HTML tags ---
     final text = _stripHtml(raw);
-    if (text.isEmpty) return null;
+    if (text.isEmpty) {
+      throw MobiExtractException(
+          'MOBI去HTML后文本为空（原始${bytes.length}字节，解压${decompressed.length}字节）');
+    }
     return text;
   }
 
@@ -271,4 +286,12 @@ class MobiTextExtractor {
 
     return s;
   }
+}
+
+/// MOBI 提取异常，携带诊断信息供 UI 显示。
+class MobiExtractException implements Exception {
+  final String message;
+  MobiExtractException(this.message);
+  @override
+  String toString() => message;
 }

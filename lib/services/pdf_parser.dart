@@ -28,6 +28,7 @@ class PdfBook {
 
 class PdfParser {
   /// 解析PDF文件，提取文本和章节信息
+  /// 失败时抛出 [Exception]，携带具体诊断信息。
   static Future<PdfBook?> parse(String filePath) async {
     // 1. 先尝试 Rust FFI
     String? text;
@@ -42,10 +43,13 @@ class PdfParser {
 
     // 2. FFI 失败或返回空 → 回退到纯 Dart 提取器（Android 等无 FFI 平台兜底）
     if (text == null || text.trim().isEmpty) {
+      // PdfTextExtractor.extract 失败时会抛出 PdfExtractException（含诊断信息）
       text = PdfTextExtractor.extract(filePath);
     }
 
-    if (text == null || text.trim().isEmpty) return null;
+    if (text == null || text.trim().isEmpty) {
+      throw Exception('PDF文本提取返回空结果');
+    }
 
     // 从文件路径推导标题
     final title = _deriveTitleFromPath(filePath);

@@ -40,10 +40,13 @@ class MobiParser {
 
     // 2. FFI 失败或返回空 → 回退到纯 Dart 提取器（Android 等无 FFI 平台兜底）
     if (text == null || text.trim().isEmpty) {
+      // MobiTextExtractor.extract 失败时会抛出 MobiExtractException（含诊断信息）
       text = MobiTextExtractor.extract(filePath);
     }
 
-    if (text == null || text.trim().isEmpty) return null;
+    if (text == null || text.trim().isEmpty) {
+      throw Exception('MOBI文本提取返回空结果');
+    }
 
     // 从文件路径推导标题
     final title = _deriveTitleFromPath(filePath);

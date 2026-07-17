@@ -8,45 +8,59 @@ library;
 
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:developer' as dev;
 
 /// Extracts text content from a PDF file using pure Dart (no FFI).
 class PdfTextExtractor {
   /// Extract all text from [filePath].
-  /// Returns null if extraction fails; empty string if no text was found.
+  /// Returns the extracted text, or null if no text was found.
+  /// Throws [PdfExtractException] with a diagnostic message on parse errors.
   static String? extract(String filePath) {
-    try {
-      final bytes = File(filePath).readAsBytesSync();
-      return _extractFromBytes(bytes);
-    } catch (_) {
-      return null;
-    }
+    final bytes = File(filePath).readAsBytesSync();
+    return _extractFromBytes(bytes);
   }
 
   static String? _extractFromBytes(Uint8List bytes) {
+    if (bytes.length < 8 || !_matchAt(bytes, 0, _pdfHeader)) {
+      throw PdfExtractException('文件不是有效的PDF（缺少%PDF头）');
+    }
+
     final buffers = <Uint8List>[];
+    var streamCount = 0;
     var pos = 0;
     while (pos <= bytes.length - 6) {
       if (_matchAt(bytes, pos, _streamMarker) &&
           (pos == 0 || _isPdfWs(bytes[pos - 1]))) {
+        streamCount++;
         var start = pos + 6;
         if (start < bytes.length && bytes[start] == 0x0D) start++;
         if (start < bytes.length && bytes[start] == 0x0A) start++;
         final endIdx = _findEndStream(bytes, start);
-        if (endIdx == -1) break;
+        if (endIdx == -1) {
+          pos++;
+          continue;
+        }
         var streamEnd = endIdx;
         while (streamEnd > start && _isPdfWs(bytes[streamEnd - 1])) {
           streamEnd--;
         }
         if (streamEnd > start) {
           final streamData = Uint8List.sublistView(bytes, start, streamEnd);
-          buffers.add(_maybeInflate(streamData));
+          final inflated = _maybeInflate(streamData);
+          // 只保留解压后含可打印内容的流（过滤纯图像流）
+          buffers.add(inflated);
         }
         pos = endIdx + _endstreamMarker.length;
       } else {
         pos++;
       }
     }
-    if (buffers.isEmpty) return null;
+
+    dev.log('PDF: found $streamCount streams, ${buffers.length} extracted');
+
+    if (buffers.isEmpty) {
+      throw PdfExtractException('PDF中未找到任何stream对象（可能是扫描版或加密PDF）');
+    }
 
     final totalLen = buffers.fold(0, (a, b) => a + b.length);
     final content = Uint8List(totalLen);
@@ -56,9 +70,14 @@ class PdfTextExtractor {
       off += buf.length;
     }
     final text = _extractTextFromContent(content);
-    return text.isEmpty ? null : text;
+    if (text.isEmpty) {
+      throw PdfExtractException(
+          'PDF包含$streamCount个stream但未提取到文本（可能是扫描版PDF，文本为图片）');
+    }
+    return text;
   }
 
+  static final _pdfHeader = [0x25, 0x50, 0x44, 0x46]; // "%PDF"
   static final _streamMarker = [0x73, 0x74, 0x72, 0x65, 0x61, 0x6D]; // "stream"
   static final _endstreamMarker = [
     0x65, 0x6E, 0x64, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D
@@ -80,15 +99,26 @@ class PdfTextExtractor {
   }
 
   static Uint8List _maybeInflate(Uint8List data) {
-    // zlib stream starts with 0x78 (variants: 78 01 / 78 9C / 78 DA)
+    // 1. 尝试 zlib（头字节 0x78）
     if (data.length >= 2 && data[0] == 0x78) {
       try {
         final out = ZLibDecoder().convert(data);
         return Uint8List.fromList(out);
       } catch (_) {
-        // Not zlib, return raw
+        // zlib 头存在但解压失败，继续尝试 raw deflate
       }
     }
+    // 2. 尝试 raw deflate（无 zlib 头）
+    try {
+      final out = ZLibDecoder(raw: true).convert(data);
+      // 只接受解压后明显变大的结果（防止误判）
+      if (out.length > data.length) {
+        return Uint8List.fromList(out);
+      }
+    } catch (_) {
+      // raw deflate 也失败
+    }
+    // 3. 返回原始数据（可能是未压缩的流）
     return data;
   }
 
@@ -450,4 +480,12 @@ class PdfTextExtractor {
     text = text.trim();
     return text;
   }
+}
+
+/// PDF 提取异常，携带诊断信息供 UI 显示。
+class PdfExtractException implements Exception {
+  final String message;
+  PdfExtractException(this.message);
+  @override
+  String toString() => message;
 }
