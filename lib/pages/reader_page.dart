@@ -3,6 +3,7 @@
 /// 支持翻页动画、阅读主题、可调边距、进度拖拽跳转、鼠标滚轮翻页
 library;
 
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart';
@@ -17,6 +18,24 @@ import '../utils/chapter_parser.dart';
 import '../widgets/typeset_renderer.dart';
 import '../widgets/toc_bookmark_panel.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+// ─── 翻页模式 ───────────────────────────────────────────────
+
+enum PageTurnMode {
+  slide, // 滑动翻页（推式）
+  cover, // 覆盖翻页
+  fade,  // 淡入淡出
+  flip,  // 3D翻转
+  none,  // 无动画
+}
+
+const _pageTurnModeNames = <PageTurnMode, String>{
+  PageTurnMode.slide: '滑动',
+  PageTurnMode.cover: '覆盖',
+  PageTurnMode.fade: '淡入',
+  PageTurnMode.flip: '翻转',
+  PageTurnMode.none: '无动画',
+};
 
 // ─── 阅读主题定义 ───────────────────────────────────────────
 
@@ -158,6 +177,7 @@ class _ReaderPageState extends State<ReaderPage> {
   static const _kDarkModeKey = 'yuedu_dark_mode';
   static const _kReadingThemeKey = 'yuedu_reading_theme';
   static const _kMarginHKey = 'yuedu_margin_h';
+  static const _kPageModeKey = 'yuedu_page_mode';
 
   /// 阅读主题索引（0=白色 1=护眼 2=深色 3=浅绿）
   int _readingTheme = 0;
@@ -176,6 +196,9 @@ class _ReaderPageState extends State<ReaderPage> {
 
   /// 翻页方向（1=前进，-1=后退）
   int _pageDirection = 1;
+
+  /// 翻页模式
+  PageTurnMode _pageMode = PageTurnMode.slide;
 
   /// 拖拽进度时临时值（null=未在拖拽）
   double? _seekProgress;
@@ -542,7 +565,7 @@ class _ReaderPageState extends State<ReaderPage> {
                     height: availableHeight,
                     child: ClipRect(
                       child: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 280),
+                        duration: _pageTurnDuration,
                         switchInCurve: Curves.easeOutCubic,
                         switchOutCurve: Curves.easeIn,
                         transitionBuilder: _buildPageTransition,
@@ -583,25 +606,100 @@ class _ReaderPageState extends State<ReaderPage> {
 
   // ─── 翻页过渡动画 ────────────────────────────────────────
 
+  /// 翻页动画时长（根据翻页模式动态调整）
+  Duration get _pageTurnDuration {
+    switch (_pageMode) {
+      case PageTurnMode.none:
+        return const Duration(milliseconds: 1);
+      case PageTurnMode.fade:
+        return const Duration(milliseconds: 300);
+      case PageTurnMode.flip:
+        return const Duration(milliseconds: 450);
+      default:
+        return const Duration(milliseconds: 280);
+    }
+  }
+
   Widget _buildPageTransition(Widget child, Animation<double> animation) {
     final isNew = child.key == ValueKey(_offset);
     final dir = _pageDirection.toDouble();
-    final curve = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic);
 
-    // 推式翻页：新页从 dir 方向滑入，旧页同步向 -dir 方向滑出。
-    // 两页同速平移、永不在同一位置叠加，消除残影。
-    if (isNew) {
-      return SlideTransition(
-        position: Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
-            .animate(curve),
-        child: child,
-      );
-    } else {
-      return SlideTransition(
-        position: Tween<Offset>(begin: Offset.zero, end: Offset(-dir, 0))
-            .animate(curve),
-        child: child,
-      );
+    switch (_pageMode) {
+      case PageTurnMode.slide:
+        // 推式翻页：新页从 dir 方向滑入，旧页同步向 -dir 方向滑出。
+        // 两页同速平移、永不在同一位置叠加，消除残影。
+        final curve = CurvedAnimation(
+            parent: animation, curve: Curves.easeOutCubic);
+        if (isNew) {
+          return SlideTransition(
+            position:
+                Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
+                    .animate(curve),
+            child: child,
+          );
+        } else {
+          return SlideTransition(
+            position:
+                Tween<Offset>(begin: Offset.zero, end: Offset(-dir, 0))
+                    .animate(curve),
+            child: child,
+          );
+        }
+
+      case PageTurnMode.cover:
+        // 覆盖翻页：新页从 dir 方向滑入覆盖旧页，旧页保持不动。
+        final curve = CurvedAnimation(
+            parent: animation, curve: Curves.easeOutCubic);
+        if (isNew) {
+          return SlideTransition(
+            position:
+                Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
+                    .animate(curve),
+            child: child,
+          );
+        } else {
+          return child;
+        }
+
+      case PageTurnMode.fade:
+        // 淡入淡出：新旧页交叉淡入淡出。
+        final curve = CurvedAnimation(
+            parent: animation, curve: Curves.easeInOut);
+        return FadeTransition(opacity: curve, child: child);
+
+      case PageTurnMode.flip:
+        // 3D翻转：新页从边缘翻入（带透视+淡入），旧页淡出。
+        final curve = CurvedAnimation(
+            parent: animation, curve: Curves.easeOutCubic);
+        if (isNew) {
+          return AnimatedBuilder(
+            animation: curve,
+            builder: (context, builtChild) {
+              final t = curve.value;
+              final angle = (1 - t) * math.pi / 2;
+              return Transform(
+                alignment:
+                    dir > 0 ? Alignment.centerLeft : Alignment.centerRight,
+                transform: Matrix4.identity()
+                  ..setEntry(3, 2, 0.002)
+                  ..rotateY(angle * dir),
+                child: Opacity(opacity: t, child: builtChild),
+              );
+            },
+            child: child,
+          );
+        } else {
+          return AnimatedBuilder(
+            animation: curve,
+            builder: (context, builtChild) {
+              return Opacity(opacity: 1 - curve.value, child: builtChild);
+            },
+            child: child,
+          );
+        }
+
+      case PageTurnMode.none:
+        return child;
     }
   }
 
@@ -912,6 +1010,7 @@ class _ReaderPageState extends State<ReaderPage> {
       final fontSize = prefs.getDouble(_kFontSizeKey) ?? 18.0;
       final lineHeight = prefs.getDouble(_kLineHeightKey) ?? 1.8;
       final marginH = prefs.getDouble(_kMarginHKey) ?? 24.0;
+      final pageModeIdx = prefs.getInt(_kPageModeKey) ?? 0;
 
       // 兼容旧版dark mode设置
       int themeIdx = prefs.getInt(_kReadingThemeKey) ?? -1;
@@ -930,6 +1029,8 @@ class _ReaderPageState extends State<ReaderPage> {
           );
           _marginH = marginH;
           _readingTheme = themeIdx.clamp(0, _themes.length - 1);
+          _pageMode = PageTurnMode.values[
+              pageModeIdx.clamp(0, PageTurnMode.values.length - 1)];
         });
       }
     } catch (_) {}
@@ -943,6 +1044,7 @@ class _ReaderPageState extends State<ReaderPage> {
       await prefs.setDouble(_kLineHeightKey, _config.lineHeightRatio);
       await prefs.setDouble(_kMarginHKey, _marginH);
       await prefs.setInt(_kReadingThemeKey, _readingTheme);
+      await prefs.setInt(_kPageModeKey, _pageMode.index);
     } catch (_) {}
   }
 
@@ -1265,6 +1367,50 @@ class _ReaderPageState extends State<ReaderPage> {
                   setState(() => _marginH = (_marginH + 4).clamp(8.0, 48.0));
                   _saveSettings();
                 },
+              ),
+              const SizedBox(height: 12),
+              const Divider(height: 1),
+              const SizedBox(height: 12),
+              // ── 翻页模式选择 ──
+              Row(
+                children: [
+                  Text('翻页', style: TextStyle(color: _theme.hint, fontSize: 13)),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: _pageTurnModeNames.entries.map((entry) {
+                        final mode = entry.key;
+                        final name = entry.value;
+                        final selected = _pageMode == mode;
+                        return GestureDetector(
+                          onTap: () {
+                            setState(() => _pageMode = mode);
+                            _saveSettings();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: selected ? Colors.indigo : _theme.surface,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: selected ? Colors.indigo : _theme.border,
+                              ),
+                            ),
+                            child: Text(
+                              name,
+                              style: TextStyle(
+                                color: selected ? Colors.white : _theme.text,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 12),
               const Divider(height: 1),
