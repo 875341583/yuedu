@@ -80,12 +80,15 @@ class _BookshelfPageState extends State<BookshelfPage> {
   }
 
   Widget _buildBookGrid(List<Book> books) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final crossAxisCount = screenWidth < 360 ? 2 : 3;
+
     return Scrollbar(
       thumbVisibility: true,
       child: GridView.builder(
         padding: const EdgeInsets.all(16),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
+        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: crossAxisCount,
           childAspectRatio: 0.62,
           crossAxisSpacing: 12,
           mainAxisSpacing: 12,

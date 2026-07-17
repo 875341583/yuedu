@@ -415,13 +415,13 @@ class _ReaderPageState extends State<ReaderPage> {
               children: [
                 const CircularProgressIndicator(color: Colors.indigo),
                 const SizedBox(height: 16),
-                Text('正在打开书籍...', style: TextStyle(color: _theme.hint, fontSize: 14)),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
+                 Text('正在打开书籍...', style: TextStyle(color: _theme.hint, fontSize: 14)),
+             ],
+           ),
+         ),
+       ),
+     );
+   }
 
     // 加载错误状态
     if (_loadError != null) {
@@ -468,7 +468,17 @@ class _ReaderPageState extends State<ReaderPage> {
     }
 
     return Scaffold(
-      body: Listener(
+      body: PopScope(
+        canPop: !_showMenu,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) {
+            setState(() {
+              _showMenu = false;
+              _showSettings = false;
+            });
+          }
+        },
+        child: Listener(
         onPointerSignal: _handleScroll,
         child: KeyboardListener(
           focusNode: _focusNode,
@@ -553,6 +563,7 @@ class _ReaderPageState extends State<ReaderPage> {
             ],
           ),
         ),
+      ),
       ),
     );
   }

@@ -3,7 +3,6 @@ library;
 
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/book.dart';
@@ -24,8 +23,8 @@ class BookshelfService {
   static const _kContentKeyPrefix = 'yuedu_content_';
   static const _kVersionKey = 'yuedu_version';
 
-  /// 当前数据版本，升级时递增，用于触发种子书籍合并
-  static const _currentVersion = 3;
+  /// 当前数据版本，升级时递增，用于触发数据迁移
+  static const _currentVersion = 4;
 
   /// 内存中的书库
   final List<Book> _books = [];
@@ -619,36 +618,18 @@ class BookshelfService {
     }
   }
 
-  /// 合并种子书籍：检查预期书籍是否已在书库中，缺失的自动补上
+  /// 合并种子书籍 & 执行数据迁移
   void _mergeSeedBooks() {
     final existingIds = _books.map((b) => b.id).toSet();
     bool changed = false;
 
-    // 真书种子（仅Native平台，Web无法读取本地文件）
-    if (!kIsWeb) {
-      final realBooks = [
-        ('人间正道是沧桑', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\人间正道是沧桑txt全本精校版.txt', BookFormat.txt),
-        ('蛊真人', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\《蛊真人》精校版.txt', BookFormat.txt),
-        ('长夜余火', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\《长夜余火》（校对版全本）作者：爱潜水的乌贼.txt', BookFormat.txt),
-        ('收获文学榜2019-2021', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\《收获文学榜中短篇小说2019-2021合辑》（年度大合辑5册） (《收获》文学杂志社编) .epub', BookFormat.epub),
-        ('31B爆改1T深度调研', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\31B爆改1T_深度调研报告.pdf', BookFormat.pdf),
-        ('Pride and Prejudice (MOBI)', 'C:\\Users\\Administrator\\Desktop\\TeleAgent的工作空间\\test_book.mobi', BookFormat.mobi),
-      ];
-      for (final (title, path, format) in realBooks) {
-        final id = 'real_${title.hashCode}';
-        if (!existingIds.contains(id)) {
-          _books.add(Book(
-            id: id,
-            title: title,
-            author: '未知',
-            filePath: path,
-            format: format,
-            colorSeed: title.hashCode & 0xFFFF,
-            chapters: [],
-          ));
-          changed = true;
-        }
-      }
+    // === 数据迁移：v3 → v4 ===
+    // 移除旧版硬编码 Windows 路径的 realBooks 种子书
+    _books.removeWhere((b) =>
+        b.id.startsWith('real_') &&
+        b.filePath.contains('TeleAgent'));
+    if (_books.map((b) => b.id).toSet().length != existingIds.length) {
+      changed = true;
     }
 
     // 演示书种子

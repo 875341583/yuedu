@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: '0a3ba304-f6d3-48ea-b136-bc6e5fb93379'
+  PropagateID: '0a3ba304-f6d3-48ea-b136-bc6e5fb93379'
+  ReservedCode1: '7ced2a57-5edb-4592-bd77-1e5a4d2ba559'
+  ReservedCode2: '7ced2a57-5edb-4592-bd77-1e5a4d2ba559'
+---
+
 # 阅界 · YueDu
 
 <p align="center">
@@ -28,7 +39,7 @@
 
 - 📖 **专业中文排版** — 标点挤压（行首行尾标点压缩）、避头尾规则、中英文自动加间距，印刷级阅读体验
 - ⚡ **高性能引擎** — Rust 编写的排版引擎通过 FFI 接入，15MB 大文件流畅阅读
-- 📂 **多格式支持** — TXT（自动识别 GBK / UTF-8 编码）、EPUB
+- 📂 **多格式支持** — TXT、EPUB、PDF、MOBI（自动识别 GBK / UTF-8 编码）
 - 🗂️ **大文件按需加载** — 64KB 滑动窗口架构，百兆文件也不卡顿
 - 🌙 **深色模式** — 全局深色主题，护眼夜读
 - 💾 **阅读进度持久化** — 自动保存阅读位置、字号、行高等偏好
@@ -77,6 +88,8 @@ flutter run -d chrome --web-port=8888
 |------|----------|----------|------------|
 | TXT | GBK / UTF-8 自动识别 | 按换行段落 | 64KB 滑动窗口 |
 | EPUB | UTF-8 | OPF + NCX 解析 | 全量加载 |
+| PDF | — | 按页解析 | 全量加载 |
+| MOBI | Windows-1252 兼容 | 按标题识别 | 全量加载 |
 
 ### 阅读体验
 
@@ -221,7 +234,12 @@ flutter build web --release
 - [x] 书架管理（导入 / 删除 / 阅读记录）
 - [x] TXT 导入（GBK / UTF-8 编码自动识别）
 - [x] EPUB 导入（OPF / NCX 章节目录解析）
+- [x] PDF 导入（Rust pdf-extract 文本提取）
+- [x] MOBI 导入（Rust mobi crate，兼容 Windows-1252 编码）
 - [x] Rust 排版引擎（标点挤压 / 避头尾 / 中西文间距）
+- [x] 精确字体度量（TextPainter 预度量 + FFI 宽度表）
+- [x] 阅读体验增强（翻页动画 / 阅读主题 / 设置面板 / 进度拖拽）
+- [x] 书签与目录（章节跳转 + 键盘快捷键）
 - [x] 大文件 64KB 滑动窗口按需加载
 - [x] 阅读设置持久化（字号 / 行高 / 深色模式）
 - [x] 深色模式
@@ -229,11 +247,9 @@ flutter build web --release
 
 ### 计划中 📋
 
-- [ ] 精确字体度量（替换等宽近似为实际字形宽度）
-- [ ] CRDT 增量同步服务（商业版功能）
-- [ ] 更多格式支持（PDF / MOBI）
 - [ ] 自定义主题 / 字体
-- [ ] 书签与笔记
+- [ ] CRDT 增量同步服务（商业版功能）
+- [ ] CBZ / CBR 漫画格式支持
 - [ ] TTS 朗读
 
 ---
