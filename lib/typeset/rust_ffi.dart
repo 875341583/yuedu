@@ -89,6 +89,21 @@ typedef SetCharWidthsDart = void Function(
   int count,
 );
 
+// PDF文本提取FFI签名
+typedef ExtractPdfTextNative = Pointer<Uint8> Function(
+  Pointer<Uint8> pathPtr,
+  Int32 pathLen,
+  Pointer<Int32> outLenPtr,
+);
+typedef ExtractPdfTextDart = Pointer<Uint8> Function(
+  Pointer<Uint8> pathPtr,
+  int pathLen,
+  Pointer<Int32> outLenPtr,
+);
+
+typedef FreePdfTextNative = Void Function(Pointer<Uint8> ptr, Int32 len);
+typedef FreePdfTextDart = void Function(Pointer<Uint8> ptr, int len);
+
 // =========== Rust排版引擎FFI绑定类 ===========
 
 /// Rust排版引擎的FFI绑定
@@ -105,6 +120,8 @@ class RustTypesetEngine {
   late FreeTypesetResultDart _freeTypesetResult;
   late SetFontPathDart _setFontPath;
   late SetCharWidthsDart _setCharWidths;
+  late ExtractPdfTextDart _extractPdfText;
+  late FreePdfTextDart _freePdfText;
 
   bool _initialized = false;
 
@@ -133,6 +150,14 @@ class RustTypesetEngine {
 
     _setCharWidths = _lib.lookupFunction<SetCharWidthsNative, SetCharWidthsDart>(
       'set_char_widths',
+    );
+
+    _extractPdfText = _lib.lookupFunction<ExtractPdfTextNative, ExtractPdfTextDart>(
+      'extract_pdf_text',
+    );
+
+    _freePdfText = _lib.lookupFunction<FreePdfTextNative, FreePdfTextDart>(
+      'free_pdf_text',
     );
 
     _initialized = true;
@@ -310,6 +335,37 @@ class RustTypesetEngine {
       lines: lineInfos,
       totalHeight: ffiResult.totalHeight,
     );
+  }
+
+  /// 从PDF文件提取全部文本
+  ///
+  /// [filePath] PDF文件的绝对路径
+  /// 返回提取的文本内容，失败返回null
+  String? extractPdfText(String filePath) {
+    _init();
+    if (!_initialized) return null;
+
+    final pathBytes = utf8.encode(filePath);
+    final pathLen = pathBytes.length;
+
+    return using((arena) {
+      final pathPtr = arena<Uint8>(pathLen);
+      pathPtr.asTypedList(pathLen).setAll(0, pathBytes);
+      final outLenPtr = arena<Int32>();
+
+      final textPtr = _extractPdfText(pathPtr, pathLen, outLenPtr);
+      if (textPtr == nullptr) {
+        return null;
+      }
+
+      final textLen = outLenPtr.value;
+      final text = utf8.decode(textPtr.asTypedList(textLen), allowMalformed: true);
+
+      // 释放Rust侧分配的内存
+      _freePdfText(textPtr, textLen);
+
+      return text;
+    });
   }
 
   /// 释放资源

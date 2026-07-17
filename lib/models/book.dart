@@ -114,4 +114,5 @@ class Chapter {
 enum BookFormat {
   txt,
   epub,
+  pdf,
 }

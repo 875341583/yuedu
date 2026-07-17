@@ -335,7 +335,6 @@ pub unsafe extern "C" fn typeset_ffi(
 #[no_mangle]
 pub unsafe extern "C" fn free_typeset_result(result: FFITypesetResult) {
     if !result.glyphs_ptr.is_null() && result.glyph_count > 0 {
-        // 安全：恢复Vec并让其自然drop
         let _ = unsafe {
             Vec::from_raw_parts(
                 result.glyphs_ptr,
@@ -353,6 +352,75 @@ pub unsafe extern "C" fn free_typeset_result(result: FFITypesetResult) {
             )
         };
     }
+}
+
+// =========== PDF 文本提取 FFI ===========
+
+/// 从PDF文件中提取全部文本
+///
+/// # 参数
+/// - `path_ptr`: UTF-8文件路径的指针
+/// - `path_len`: 路径字节长度
+/// - `out_len_ptr`: 输出文本长度的指针（字节，不含末尾\0）
+///
+/// # 返回
+/// - 非空指针: 成功，指向UTF-8文本（以\0结尾），长度通过out_len_ptr写出
+/// - 空指针: 失败
+///
+/// # 安全要求
+/// - `path_ptr`必须指向有效的UTF-8数据，长度为`path_len`
+/// - `out_len_ptr`必须指向有效的c_int可写内存
+/// - 调用方必须在使用完毕后调用`free_pdf_text`释放内存
+#[no_mangle]
+pub unsafe extern "C" fn extract_pdf_text(
+    path_ptr: *const u8,
+    path_len: c_int,
+    out_len_ptr: *mut c_int,
+) -> *mut u8 {
+    let path_str = unsafe {
+        let slice = slice::from_raw_parts(path_ptr, path_len as usize);
+        match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+
+    let text = match pdf_extract::extract_text(path_str) {
+        Ok(t) => t,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let text_bytes = text.as_bytes();
+    let total_len = text_bytes.len();
+
+    // 分配 text_len + 1 字节（含null terminator）
+    let layout = std::alloc::Layout::from_size_align(total_len + 1, 1).unwrap();
+    let buf = unsafe { std::alloc::alloc(layout) };
+    if buf.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(text_bytes.as_ptr(), buf, total_len);
+        *buf.add(total_len) = 0; // null terminator
+        *out_len_ptr = total_len as c_int;
+    }
+
+    buf
+}
+
+/// 释放extract_pdf_text返回的文本内存
+///
+/// # 安全要求
+/// - `ptr`必须是由`extract_pdf_text`返回的指针
+/// - `len`必须与extract_pdf_text写出的长度一致
+/// - 每个指针只能释放一次
+#[no_mangle]
+pub unsafe extern "C" fn free_pdf_text(ptr: *mut u8, len: c_int) {
+    if ptr.is_null() { return; }
+    let total = (len as usize) + 1; // +1 for null terminator
+    let layout = std::alloc::Layout::from_size_align(total, 1).unwrap();
+    unsafe { std::alloc::dealloc(ptr, layout); }
 }
 
 #[cfg(test)]

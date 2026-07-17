@@ -109,7 +109,7 @@ class _BookshelfPageState extends State<BookshelfPage> {
   Future<void> _importFromFile() async {
     final result = await FilePicker.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['txt', 'epub'],
+      allowedExtensions: ['txt', 'epub', 'pdf'],
       allowMultiple: true,
     );
 
@@ -121,9 +121,12 @@ class _BookshelfPageState extends State<BookshelfPage> {
         // Native平台：有实际文件路径
         final path = pickedFile.path!;
         final isEpub = path.toLowerCase().endsWith('.epub');
-        final book = isEpub
-            ? await _service.importEpub(path)
-            : await _service.importTxt(path);
+        final isPdf = path.toLowerCase().endsWith('.pdf');
+        final book = isPdf
+            ? await _service.importPdf(path)
+            : isEpub
+                ? await _service.importEpub(path)
+                : await _service.importTxt(path);
         if (book != null && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('已导入: ${book.title}'), duration: const Duration(seconds: 2)),
@@ -240,7 +243,7 @@ class _BookCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
-                  book.format == BookFormat.txt ? 'TXT' : 'EPUB',
+                  book.format == BookFormat.txt ? 'TXT' : book.format == BookFormat.epub ? 'EPUB' : 'PDF',
                   style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 10),
                 ),
               ),
