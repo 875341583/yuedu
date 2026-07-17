@@ -1,10 +1,12 @@
 /// PDF解析服务
-/// 通过Rust FFI调用pdf-extract crate提取PDF文本内容
+/// 通过Rust FFI调用pdf-extract crate提取PDF文本内容；
+/// FFI不可用时回退到纯Dart提取器（PdfTextExtractor）。
 library;
 
 import 'dart:io';
 
 import '../typeset/rust_ffi.dart';
+import '../utils/pdf_text_extractor.dart';
 import '../models/book.dart';
 
 /// PDF解析结果
@@ -27,47 +29,55 @@ class PdfBook {
 class PdfParser {
   /// 解析PDF文件，提取文本和章节信息
   static Future<PdfBook?> parse(String filePath) async {
+    // 1. 先尝试 Rust FFI
+    String? text;
     final engine = RustTypesetEngine();
     try {
-      final text = engine.extractPdfText(filePath);
-      if (text == null || text.trim().isEmpty) return null;
-
-      // 从文件路径推导标题
-      final title = _deriveTitleFromPath(filePath);
-
-      // 简单分页：按连续两个换行符分段，每段视为一页/章节
-      final pages = text.split(RegExp(r'\n{2,}'));
-      final chapters = <Chapter>[];
-      int currentOffset = 0;
-
-      for (int i = 0; i < pages.length; i++) {
-        final pageText = pages[i].trim();
-        if (pageText.isEmpty) continue;
-
-        // 尝试从页面文本开头提取章节标题
-        final chapterTitle = _extractChapterTitle(pageText) ?? '第${i + 1}页';
-
-        chapters.add(Chapter(
-          title: chapterTitle,
-          startOffset: currentOffset,
-          endOffset: currentOffset + pageText.length,
-        ));
-
-        currentOffset += pageText.length + 2; // +2 for \n\n
-      }
-
-      return PdfBook(
-        title: title,
-        author: '未知',
-        pageCount: pages.where((p) => p.trim().isNotEmpty).length,
-        chapters: chapters,
-        fullText: text,
-      );
-    } catch (e) {
-      return null;
+      text = engine.extractPdfText(filePath);
+    } catch (_) {
+      text = null;
     } finally {
       engine.dispose();
     }
+
+    // 2. FFI 失败或返回空 → 回退到纯 Dart 提取器（Android 等无 FFI 平台兜底）
+    if (text == null || text.trim().isEmpty) {
+      text = PdfTextExtractor.extract(filePath);
+    }
+
+    if (text == null || text.trim().isEmpty) return null;
+
+    // 从文件路径推导标题
+    final title = _deriveTitleFromPath(filePath);
+
+    // 简单分页：按连续两个换行符分段，每段视为一页/章节
+    final pages = text.split(RegExp(r'\n{2,}'));
+    final chapters = <Chapter>[];
+    int currentOffset = 0;
+
+    for (int i = 0; i < pages.length; i++) {
+      final pageText = pages[i].trim();
+      if (pageText.isEmpty) continue;
+
+      // 尝试从页面文本开头提取章节标题
+      final chapterTitle = _extractChapterTitle(pageText) ?? '第${i + 1}页';
+
+      chapters.add(Chapter(
+        title: chapterTitle,
+        startOffset: currentOffset,
+        endOffset: currentOffset + pageText.length,
+      ));
+
+      currentOffset += pageText.length + 2; // +2 for \n\n
+    }
+
+    return PdfBook(
+      title: title,
+      author: '未知',
+      pageCount: pages.where((p) => p.trim().isNotEmpty).length,
+      chapters: chapters,
+      fullText: text,
+    );
   }
 
   /// 从文件路径推导标题

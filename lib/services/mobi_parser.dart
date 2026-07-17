@@ -1,10 +1,12 @@
 /// MOBI解析服务
-/// 通过Rust FFI调用mobi crate提取MOBI文本内容
+/// 通过Rust FFI调用mobi crate提取MOBI文本内容；
+/// FFI不可用时回退到纯Dart提取器（MobiTextExtractor）。
 library;
 
 import 'dart:io';
 
 import '../typeset/rust_ffi.dart';
+import '../utils/mobi_text_extractor.dart';
 import '../models/book.dart';
 
 /// MOBI解析结果
@@ -25,29 +27,37 @@ class MobiBook {
 class MobiParser {
   /// 解析MOBI文件，提取文本和章节信息
   static Future<MobiBook?> parse(String filePath) async {
+    // 1. 先尝试 Rust FFI
+    String? text;
     final engine = RustTypesetEngine();
     try {
-      final text = engine.extractMobiText(filePath);
-      if (text == null || text.trim().isEmpty) return null;
-
-      // 从文件路径推导标题
-      final title = _deriveTitleFromPath(filePath);
-
-      // MOBI内容已经由Rust端去HTML标签，
-      // 按连续两个换行符分段，识别章节
-      final chapters = _extractChapters(text);
-
-      return MobiBook(
-        title: title,
-        author: '未知',
-        chapters: chapters,
-        fullText: text,
-      );
-    } catch (e) {
-      return null;
+      text = engine.extractMobiText(filePath);
+    } catch (_) {
+      text = null;
     } finally {
       engine.dispose();
     }
+
+    // 2. FFI 失败或返回空 → 回退到纯 Dart 提取器（Android 等无 FFI 平台兜底）
+    if (text == null || text.trim().isEmpty) {
+      text = MobiTextExtractor.extract(filePath);
+    }
+
+    if (text == null || text.trim().isEmpty) return null;
+
+    // 从文件路径推导标题
+    final title = _deriveTitleFromPath(filePath);
+
+    // MOBI内容已经由Rust端或Dart端去HTML标签，
+    // 按连续两个换行符分段，识别章节
+    final chapters = _extractChapters(text);
+
+    return MobiBook(
+      title: title,
+      author: '未知',
+      chapters: chapters,
+      fullText: text,
+    );
   }
 
   /// 从文件路径推导标题

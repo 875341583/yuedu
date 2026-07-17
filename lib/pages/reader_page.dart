@@ -583,16 +583,18 @@ class _ReaderPageState extends State<ReaderPage> {
 
   Widget _buildPageTransition(Widget child, Animation<double> animation) {
     final isNew = child.key == ValueKey(_offset);
+
+    // Only slide the new page in; the old page stays put and gets covered
+    // by the new page's solid background. No FadeTransition = no ghosting.
+    if (!isNew) {
+      return child;
+    }
+
     final dir = _pageDirection.toDouble();
-
-    // 新页：从方向滑入；旧页：向相反方向滑出
-    final tween = isNew
-        ? Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
-        : Tween<Offset>(begin: Offset.zero, end: Offset(-dir, 0));
-
     return SlideTransition(
-      position: tween.animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
-      child: FadeTransition(opacity: animation, child: child),
+      position: Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
+          .animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
+      child: child,
     );
   }
 
