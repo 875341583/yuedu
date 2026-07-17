@@ -2,7 +2,8 @@
 ///
 /// 根据运行平台自动路由：
 /// - Web平台：使用Dart纯实现引擎（dart:ffi在Web上不可用）
-/// - Native平台（Windows/Android/macOS/Linux）：使用Rust FFI引擎
+/// - Native平台（Windows/Android/macOS/Linux）：优先使用Rust FFI引擎
+///   - FFI初始化失败时自动回退到Dart纯实现引擎
 ///
 /// 使用Dart条件导入（conditional imports）实现平台路由：
 /// `native_engine.dart` 导入dart:ffi，仅在Native平台编译
@@ -41,9 +42,24 @@ class DartTypesetEngine implements TypesetEngine {
 class TypesetEngineProvider {
   static TypesetEngine? _engine;
 
+  /// FFI引擎是否初始化失败（用于调试/显示）
+  static bool _ffiFailed = false;
+
   /// 获取当前平台的排版引擎
+  ///
+  /// 优先尝试Rust FFI引擎；若FFI初始化失败（如.so加载失败），
+  /// 自动回退到纯Dart排版引擎，确保排版功能始终可用。
   static TypesetEngine get engine {
-    _engine ??= platform.createNativeEngine();
+    if (_engine == null) {
+      try {
+        _engine = platform.createNativeEngine();
+        _ffiFailed = false;
+      } catch (e) {
+        // FFI不可用（.so加载失败/函数查找失败等），回退到纯Dart引擎
+        _engine = DartTypesetEngine();
+        _ffiFailed = true;
+      }
+    }
     return _engine!;
   }
 
@@ -53,6 +69,12 @@ class TypesetEngineProvider {
     _engine = null;
   }
 
+  /// FFI引擎是否可用（false=正在使用Dart回退引擎）
+  static bool get isFfiAvailable => !_ffiFailed;
+
   /// 当前使用的引擎类型名称（用于调试/显示）
-  static String get engineName => platform.nativeEngineName;
+  static String get engineName {
+    if (_ffiFailed) return 'Dart Fallback';
+    return platform.nativeEngineName;
+  }
 }

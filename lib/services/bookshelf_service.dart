@@ -392,7 +392,9 @@ class BookshelfService {
 
     try {
       final pdfBook = await PdfParser.parse(book.filePath);
-      if (pdfBook == null) return '';
+      if (pdfBook == null) {
+        throw Exception('PDF文本提取失败，当前设备可能不支持此格式');
+      }
 
       _pdfCache[book.id] = pdfBook;
 
@@ -407,7 +409,8 @@ class BookshelfService {
 
       return pdfBook.fullText;
     } catch (e) {
-      return '';
+      if (e is Exception) rethrow;
+      throw Exception('PDF解析异常: $e');
     }
   }
 
@@ -440,7 +443,9 @@ class BookshelfService {
 
     try {
       final mobiBook = await MobiParser.parse(book.filePath);
-      if (mobiBook == null) return '';
+      if (mobiBook == null) {
+        throw Exception('MOBI文本提取失败，当前设备可能不支持此格式');
+      }
 
       _mobiCache[book.id] = mobiBook;
 
@@ -455,7 +460,8 @@ class BookshelfService {
 
       return mobiBook.fullText;
     } catch (e) {
-      return '';
+      if (e is Exception) rethrow;
+      throw Exception('MOBI解析异常: $e');
     }
   }
 

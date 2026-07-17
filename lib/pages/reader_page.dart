@@ -339,7 +339,18 @@ class _ReaderPageState extends State<ReaderPage> {
     final fetchEnd = (startOffset + estimatedChars * 4).clamp(0, _textWindow.length);
 
     final text = _textWindow.substring(startOffset, fetchEnd);
-    final result = engine.typeset(text, _config);
+
+    TypesetResult result;
+    try {
+      result = engine.typeset(text, _config);
+    } catch (e) {
+      // 排版引擎异常（FFI崩溃等），返回空页避免灰屏
+      return _PageData(
+        startOffset: startOffset,
+        endOffset: fetchEnd,
+        result: const TypesetResult(glyphs: [], lines: [], totalHeight: 0),
+      );
+    }
 
     // 如果排版高度不够（说明文本短），直接返回整段
     if (result.totalHeight <= availableHeight || result.lines.isEmpty) {
