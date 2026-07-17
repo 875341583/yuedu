@@ -135,7 +135,8 @@ class ReaderPage extends StatefulWidget {
   State<ReaderPage> createState() => _ReaderPageState();
 }
 
-class _ReaderPageState extends State<ReaderPage> {
+class _ReaderPageState extends State<ReaderPage>
+    with TickerProviderStateMixin {
   /// 文本窗口：当前加载的文本块（约32KB字符）
   String _textWindow = '';
 
@@ -197,6 +198,35 @@ class _ReaderPageState extends State<ReaderPage> {
   /// 翻页方向（1=前进，-1=后退）
   int _pageDirection = 1;
 
+  // ─── 跟手翻页状态 ───────────────────────────────────────
+  /// 当前拖拽的水平偏移（px）。正值=向右拖（露出上一页），
+  /// 负值=向左拖（露出下一页）。0 表示静止。
+  double _dragExtent = 0;
+
+  /// 是否正在拖拽
+  bool _isDragging = false;
+
+  /// 松手后的完成/回弹动画控制器（值域 0..1，配合 _animFromExtent）
+  late final AnimationController _turnController;
+
+  /// 动画起始偏移（拖拽松手时的 _dragExtent 快照）
+  double _animFromExtent = 0;
+
+  /// 动画目标偏移（±屏宽=翻页，0=回弹）
+  double _animTargetExtent = 0;
+
+  /// 当前屏宽（含边距，用于跟手动画范围）
+  double _pageFullWidth = 0;
+
+  /// 上次 build 的可用高度（手势回调里预计算相邻页用）
+  double _lastAvailableHeight = 0;
+
+  /// 拖拽中预计算的相邻页排版数据（按方向只算需要的那一侧）
+  _PageData? _dragNeighborPage;
+
+  /// 拖拽方向对应的相邻页偏移（-1=上一页，1=下一页，0=无）
+  int _dragDir = 0;
+
   /// 翻页模式
   PageTurnMode _pageMode = PageTurnMode.slide;
 
@@ -233,6 +263,12 @@ class _ReaderPageState extends State<ReaderPage> {
   @override
   void initState() {
     super.initState();
+    _turnController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+    );
+    _turnController.addListener(_onTurnAnimTick);
+    _turnController.addStatusListener(_onTurnAnimStatus);
     _loadSettings();
     _loadContent();
     _loadBookmarks();
@@ -288,8 +324,61 @@ class _ReaderPageState extends State<ReaderPage> {
   @override
   void dispose() {
     _savePosition();
+    _turnController.dispose();
     _focusNode.dispose();
     super.dispose();
+  }
+
+  // ─── 跟手翻页：动画状态回调 ───────────────────────────────
+
+  /// 每帧驱动：把 _dragExtent 从起始值插值到目标值
+  void _onTurnAnimTick() {
+    final t = _turnController.value;
+    setState(() {
+      _dragExtent =
+          _animFromExtent + (_animTargetExtent - _animFromExtent) * t;
+    });
+  }
+
+  void _onTurnAnimStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed) return;
+    _turnController.value = 0;
+    // 动画结束：若目标偏移超过半屏则完成翻页，否则已回弹归位
+    if (_animTargetExtent.abs() > _pageFullWidth * 0.5) {
+      _commitTurn(_animTargetExtent > 0 ? -1 : 1);
+    } else {
+      setState(() {
+        _dragExtent = 0;
+        _dragNeighborPage = null;
+        _dragDir = 0;
+      });
+    }
+  }
+
+  /// 完成翻页：真正切换 _offset 并重置拖拽状态。
+  /// 使用跟手时预计算的相邻页 startOffset，保证切换前后内容一致、无闪烁。
+  void _commitTurn(int dir) {
+    final neighbor = _dragNeighborPage;
+    final newOffset = neighbor?.startOffset ?? -1;
+    setState(() {
+      _dragExtent = 0;
+      _dragNeighborPage = null;
+      _dragDir = 0;
+    });
+    if (neighbor != null && newOffset >= 0 && newOffset != _offset) {
+      _pageDirection = dir;
+      setState(() {
+        _offset = newOffset;
+      });
+      _savePosition();
+    } else {
+      // 兜底：边界情况走原翻页逻辑
+      if (dir < 0) {
+        _prevPage();
+      } else {
+        _nextPage();
+      }
+    }
   }
 
   Future<void> _loadContent() async {
@@ -431,6 +520,10 @@ class _ReaderPageState extends State<ReaderPage> {
     final availableWidth = pageSize.width - 2 * _marginH;
     final availableHeight = pageSize.height - safePadding.top - safePadding.bottom - 16;
 
+    // 缓存供手势回调使用
+    _pageFullWidth = pageSize.width;
+    _lastAvailableHeight = availableHeight;
+
     _config = TypesetConfig(
       fontSize: _config.fontSize,
       lineHeightRatio: _config.lineHeightRatio,
@@ -552,7 +645,9 @@ class _ReaderPageState extends State<ReaderPage> {
               GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTapUp: _handleTap,
-                onHorizontalDragEnd: _handleSwipe,
+                onHorizontalDragStart: _handleDragStart,
+                onHorizontalDragUpdate: _handleDragUpdate,
+                onHorizontalDragEnd: _handleDragEnd,
                 child: Container(
                   color: _theme.bg,
                   padding: EdgeInsets.only(
@@ -564,13 +659,7 @@ class _ReaderPageState extends State<ReaderPage> {
                   child: SizedBox(
                     height: availableHeight,
                     child: ClipRect(
-                      child: AnimatedSwitcher(
-                        duration: _pageTurnDuration,
-                        switchInCurve: Curves.easeOutCubic,
-                        switchOutCurve: Curves.easeIn,
-                        transitionBuilder: _buildPageTransition,
-                        child: _buildPageContent(availableHeight),
-                      ),
+                      child: _buildPageTurnView(availableHeight),
                     ),
                   ),
                 ),
@@ -604,102 +693,101 @@ class _ReaderPageState extends State<ReaderPage> {
     );
   }
 
-  // ─── 翻页过渡动画 ────────────────────────────────────────
+  // ─── 跟手翻页渲染 ────────────────────────────────────────
 
-  /// 翻页动画时长（根据翻页模式动态调整）
-  Duration get _pageTurnDuration {
-    switch (_pageMode) {
-      case PageTurnMode.none:
-        return const Duration(milliseconds: 1);
-      case PageTurnMode.fade:
-        return const Duration(milliseconds: 300);
-      case PageTurnMode.flip:
-        return const Duration(milliseconds: 450);
-      default:
-        return const Duration(milliseconds: 280);
+  /// 跟手翻页视图：拖拽/动画过程中实时联动当前页与相邻页；
+  /// 静止时仅渲染当前页。
+  Widget _buildPageTurnView(double availableHeight) {
+    final currentPage = _buildPageContent(availableHeight);
+
+    // 静止或无动画模式：仅当前页
+    if ((_dragExtent == 0 && !_turnController.isAnimating) ||
+        _pageMode == PageTurnMode.none) {
+      return currentPage;
     }
-  }
 
-  Widget _buildPageTransition(Widget child, Animation<double> animation) {
-    final isNew = child.key == ValueKey(_offset);
-    final dir = _pageDirection.toDouble();
+    final w = _pageFullWidth;
+    final p = (_dragExtent / w).clamp(-1.0, 1.0); // -1..1
+    final absP = p.abs();
+    final neighbor = _dragNeighborPage;
+
+    Widget? neighborWidget;
+    if (neighbor != null) {
+      neighborWidget = SizedBox(
+        height: availableHeight,
+        child: TypesetRendererWidget(
+          result: neighbor.result,
+          config: _config,
+          textColor: _theme.text,
+          bgColor: _theme.bg,
+        ),
+      );
+    }
+
+    // 相邻页在屏幕外的起始偏移：向右拖(p>0)看上一页→左侧；向左拖(p<0)看下一页→右侧
+    final neighborBase = p > 0 ? -w : w;
 
     switch (_pageMode) {
       case PageTurnMode.slide:
-        // 推式翻页：新页从 dir 方向滑入，旧页同步向 -dir 方向滑出。
-        // 两页同速平移、永不在同一位置叠加，消除残影。
-        final curve = CurvedAnimation(
-            parent: animation, curve: Curves.easeOutCubic);
-        if (isNew) {
-          return SlideTransition(
-            position:
-                Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
-                    .animate(curve),
-            child: child,
-          );
-        } else {
-          return SlideTransition(
-            position:
-                Tween<Offset>(begin: Offset.zero, end: Offset(-dir, 0))
-                    .animate(curve),
-            child: child,
-          );
-        }
+        // 推式：当前页随手指平移，相邻页从对侧同步进入（两者不重叠）
+        return Stack(
+          children: [
+            if (neighborWidget != null)
+              Transform.translate(
+                offset: Offset(neighborBase + _dragExtent, 0),
+                child: neighborWidget,
+              ),
+            Transform.translate(
+              offset: Offset(_dragExtent, 0),
+              child: currentPage,
+            ),
+          ],
+        );
 
       case PageTurnMode.cover:
-        // 覆盖翻页：新页从 dir 方向滑入覆盖旧页，旧页保持不动。
-        final curve = CurvedAnimation(
-            parent: animation, curve: Curves.easeOutCubic);
-        if (isNew) {
-          return SlideTransition(
-            position:
-                Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
-                    .animate(curve),
-            child: child,
-          );
-        } else {
-          return child;
-        }
+        // 覆盖：当前页不动，相邻页从边缘滑入覆盖
+        return Stack(
+          children: [
+            currentPage,
+            if (neighborWidget != null)
+              Transform.translate(
+                offset: Offset(neighborBase + _dragExtent, 0),
+                child: neighborWidget,
+              ),
+          ],
+        );
 
       case PageTurnMode.fade:
-        // 淡入淡出：新旧页交叉淡入淡出。
-        final curve = CurvedAnimation(
-            parent: animation, curve: Curves.easeInOut);
-        return FadeTransition(opacity: curve, child: child);
+        // 淡入淡出：相邻页淡入，当前页淡出
+        return Stack(
+          children: [
+            Opacity(opacity: (1 - absP).clamp(0.0, 1.0), child: currentPage),
+            if (neighborWidget != null)
+              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
+          ],
+        );
 
       case PageTurnMode.flip:
-        // 3D翻转：新页从边缘翻入（带透视+淡入），旧页淡出。
-        final curve = CurvedAnimation(
-            parent: animation, curve: Curves.easeOutCubic);
-        if (isNew) {
-          return AnimatedBuilder(
-            animation: curve,
-            builder: (context, builtChild) {
-              final t = curve.value;
-              final angle = (1 - t) * math.pi / 2;
-              return Transform(
-                alignment:
-                    dir > 0 ? Alignment.centerLeft : Alignment.centerRight,
-                transform: Matrix4.identity()
-                  ..setEntry(3, 2, 0.002)
-                  ..rotateY(angle * dir),
-                child: Opacity(opacity: t, child: builtChild),
-              );
-            },
-            child: child,
-          );
-        } else {
-          return AnimatedBuilder(
-            animation: curve,
-            builder: (context, builtChild) {
-              return Opacity(opacity: 1 - curve.value, child: builtChild);
-            },
-            child: child,
-          );
-        }
+        // 3D翻转：当前页绕拖拽起始边缘旋转淡出，相邻页淡入
+        final angle = absP * (math.pi / 2);
+        final align = p > 0 ? Alignment.centerLeft : Alignment.centerRight;
+        return Stack(
+          children: [
+            if (neighborWidget != null)
+              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
+            Transform(
+              alignment: align,
+              transform: Matrix4.identity()
+                ..setEntry(3, 2, 0.002)
+                ..rotateY(angle * (p > 0 ? 1 : -1)),
+              child:
+                  Opacity(opacity: (1 - absP * 0.6).clamp(0.0, 1.0), child: currentPage),
+            ),
+          ],
+        );
 
       case PageTurnMode.none:
-        return child;
+        return currentPage;
     }
   }
 
@@ -734,13 +822,103 @@ class _ReaderPageState extends State<ReaderPage> {
     }
   }
 
-  void _handleSwipe(DragEndDetails details) {
-    final velocity = details.primaryVelocity ?? 0;
-    if (velocity < -300) {
-      _nextPage();
-    } else if (velocity > 300) {
-      _prevPage();
+  // ─── 跟手翻页：手势处理 ───────────────────────────────────
+
+  /// 预计算相邻页排版数据。dir: -1=上一页, 1=下一页。
+  /// 返回 null 表示无相邻页（边界/大文件窗口处）。
+  _PageData? _prepareNeighborPage(int dir) {
+    final h = _lastAvailableHeight;
+    if (h <= 0 || _currentPage == null) return null;
+    if (dir < 0) {
+      // 上一页
+      if (_offset <= 0) {
+        // 窗口起点：大文件可回退窗口，但跟手不支持跨窗口，返回 null
+        return null;
+      }
+      final currentPageChars =
+          _currentPage!.endOffset - _currentPage!.startOffset;
+      final prevOffset =
+          (_offset - (currentPageChars * 1.5).floor()).clamp(0, _textWindow.length);
+      if (prevOffset >= _offset) return null;
+      return _computePage(prevOffset, h);
+    } else {
+      // 下一页
+      if (_nextPageOffset < 0) return null;
+      // 大文件需加载新窗口时，跟手不支持
+      if (_nextPageOffset == _textWindow.length && _isLargeFile) return null;
+      if (_nextPageOffset >= _textWindow.length) return null;
+      return _computePage(_nextPageOffset, h);
     }
+  }
+
+  void _handleDragStart(DragStartDetails details) {
+    _isDragging = true;
+    if (_turnController.isAnimating) {
+      _turnController.stop();
+    }
+    _dragDir = 0;
+  }
+
+  void _handleDragUpdate(DragUpdateDetails details) {
+    if (!_isDragging) return;
+    final delta = details.primaryDelta ?? 0;
+    var next = _dragExtent + delta;
+    final w = _pageFullWidth;
+    // 确定方向（首次越过阈值）
+    if (_dragDir == 0 && next.abs() > 6) {
+      _dragDir = next > 0 ? -1 : 1;
+      _dragNeighborPage = _prepareNeighborPage(_dragDir);
+    }
+    // 方向确定后禁止变号，避免相邻页来回切换
+    if (_dragDir == -1) {
+      next = next.clamp(0.0, w);
+    } else if (_dragDir == 1) {
+      next = next.clamp(-w, 0.0);
+    } else {
+      next = next.clamp(-w, w);
+    }
+    // 无相邻页时做橡皮筋衰减（拖动阻力）
+    if (_dragNeighborPage == null) {
+      next = next * 0.32;
+    }
+    setState(() {
+      _dragExtent = next;
+    });
+  }
+
+  void _handleDragEnd(DragEndDetails details) {
+    if (!_isDragging) return;
+    _isDragging = false;
+    final velocity = details.primaryVelocity ?? 0;
+    final w = _pageFullWidth;
+
+    // 无相邻页：直接回弹
+    if (_dragNeighborPage == null || _dragDir == 0) {
+      _startTurnAnim(0);
+      return;
+    }
+
+    bool shouldTurn;
+    if (_dragDir == -1) {
+      // 向右拖看上一页
+      shouldTurn = _dragExtent > w * 0.33 || velocity > 320;
+    } else {
+      // 向左拖看下一页
+      shouldTurn = _dragExtent.abs() > w * 0.33 || velocity < -320;
+    }
+
+    final target = shouldTurn
+        ? (_dragDir == -1 ? w : -w)
+        : 0.0;
+    _startTurnAnim(target);
+  }
+
+  /// 启动松手后的完成/回弹动画
+  void _startTurnAnim(double target) {
+    _animFromExtent = _dragExtent;
+    _animTargetExtent = target;
+    _turnController.value = 0;
+    _turnController.forward();
   }
 
   void _handleScroll(PointerSignalEvent event) {
