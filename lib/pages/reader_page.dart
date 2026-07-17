@@ -540,12 +540,14 @@ class _ReaderPageState extends State<ReaderPage> {
                   ),
                   child: SizedBox(
                     height: availableHeight,
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 280),
-                      switchInCurve: Curves.easeOutCubic,
-                      switchOutCurve: Curves.easeIn,
-                      transitionBuilder: _buildPageTransition,
-                      child: _buildPageContent(availableHeight),
+                    child: ClipRect(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 280),
+                        switchInCurve: Curves.easeOutCubic,
+                        switchOutCurve: Curves.easeIn,
+                        transitionBuilder: _buildPageTransition,
+                        child: _buildPageContent(availableHeight),
+                      ),
                     ),
                   ),
                 ),
@@ -583,19 +585,24 @@ class _ReaderPageState extends State<ReaderPage> {
 
   Widget _buildPageTransition(Widget child, Animation<double> animation) {
     final isNew = child.key == ValueKey(_offset);
-
-    // Only slide the new page in; the old page stays put and gets covered
-    // by the new page's solid background. No FadeTransition = no ghosting.
-    if (!isNew) {
-      return child;
-    }
-
     final dir = _pageDirection.toDouble();
-    return SlideTransition(
-      position: Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
-          .animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
-      child: child,
-    );
+    final curve = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic);
+
+    // 推式翻页：新页从 dir 方向滑入，旧页同步向 -dir 方向滑出。
+    // 两页同速平移、永不在同一位置叠加，消除残影。
+    if (isNew) {
+      return SlideTransition(
+        position: Tween<Offset>(begin: Offset(dir, 0), end: Offset.zero)
+            .animate(curve),
+        child: child,
+      );
+    } else {
+      return SlideTransition(
+        position: Tween<Offset>(begin: Offset.zero, end: Offset(-dir, 0))
+            .animate(curve),
+        child: child,
+      );
+    }
   }
 
   Widget _buildPageContent(double availableHeight) {
