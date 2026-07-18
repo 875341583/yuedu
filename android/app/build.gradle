@@ -37,6 +37,17 @@ android {
             signingConfig = signingConfigs.debug
         }
     }
+
+    // 输出 APK 文件名格式：阅界-v<versionName>.apk（如 阅界-v0.4.0.apk）
+    applicationVariants.all { variant ->
+        if (variant.buildType.name == "release") {
+            variant.outputs.all { output ->
+                // outputFileName 由 defaultConfig.versionName 决定
+                def versionName = variant.versionName
+                outputFileName = "阅界-v${versionName}.apk"
+            }
+        }
+    }
 }
 
 flutter {
