@@ -1,14 +1,3 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: '0a3ba304-f6d3-48ea-b136-bc6e5fb93379'
-  PropagateID: '0a3ba304-f6d3-48ea-b136-bc6e5fb93379'
-  ReservedCode1: '7ced2a57-5edb-4592-bd77-1e5a4d2ba559'
-  ReservedCode2: '7ced2a57-5edb-4592-bd77-1e5a4d2ba559'
----
-
 # 阅界 · YueDu
 
 <p align="center">
