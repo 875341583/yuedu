@@ -116,4 +116,8 @@ enum BookFormat {
   epub,
   pdf,
   mobi,
+  docx,
+  pptx,
+  xlsx,
+  ofd,
 }

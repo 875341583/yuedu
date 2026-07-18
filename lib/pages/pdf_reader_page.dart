@@ -1,7 +1,10 @@
 /// PDF 阅读页面
 ///
 /// 使用 pdfrx（PDFium 引擎）将 PDF 每页渲染为图片显示，
-/// 支持任意 PDF（文本型/扫描型/加密），缩放、滚动、页码跳转。
+/// 支持任意 PDF（文本型/扫描型/加密）。
+/// 提供两种视图模式：
+///   - scroll：连续滚动（PdfViewer）
+///   - page：单页分页翻页（PageView + PdfPageView，跟手滑动）
 /// 与排版阅读页（ReaderPage）解耦：PDF 书走本页，其他格式仍走排版引擎。
 library;
 
@@ -13,6 +16,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
 import '../services/bookshelf_service.dart';
 
+/// PDF 视图模式：scroll=连续滚动，page=单页分页翻页
+enum PdfViewMode { scroll, page }
+
+const _kPdfViewModeKey = 'yuedu_pdf_view_mode';
+const _kPdfPagePrefix = 'yuedu_pdf_page_';
+
 class PdfReaderPage extends StatefulWidget {
   final Book book;
 
@@ -23,7 +32,11 @@ class PdfReaderPage extends StatefulWidget {
 }
 
 class _PdfReaderPageState extends State<PdfReaderPage> {
-  final PdfViewerController _controller = PdfViewerController();
+  // 滚动模式控制器
+  final PdfViewerController _scrollController = PdfViewerController();
+
+  // 分页模式控制器
+  PageController? _pageController;
 
   /// 是否显示顶/底菜单栏
   bool _showMenu = false;
@@ -40,39 +53,56 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   /// 拖拽滑块时的临时进度（0~1），null=未在拖拽
   double? _seekProgress;
 
-  /// 记录上次的纵向亮度遮罩比例（暂留接口）
-  static const _kPdfPagePrefix = 'yuedu_pdf_page_';
+  /// 当前视图模式
+  PdfViewMode _viewMode = PdfViewMode.scroll;
+
+  /// 分页模式的 PdfDocument（独立于 PdfViewer）
+  PdfDocument? _document;
+  bool _docLoading = false;
+  String? _docError;
+
+  /// 初始页码（从持久化读取）
+  int _initialPage = 1;
+
+  /// 异步初始化是否完成
+  bool _initialized = false;
 
   @override
   void initState() {
     super.initState();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _initAsync();
   }
 
-  @override
-  void dispose() {
-    _persistPosition();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    super.dispose();
-  }
-
-  /// 持久化当前页码
-  Future<void> _persistPosition() async {
-    final page = _pageNumber;
-    if (page != null && page > 0) {
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setInt('$_kPdfPagePrefix${widget.book.id}', page);
-        // 同步到书库阅读位置（用于书架排序/展示）
-        if (_pageCount > 0) {
-          BookshelfService.instance
-              .updateReadPosition(widget.book.id, page);
-        }
-      } catch (_) {}
+  Future<void> _initAsync() async {
+    _viewMode = await _loadViewMode();
+    _initialPage = await _loadSavedPage();
+    if (!mounted) return;
+    setState(() => _initialized = true);
+    if (_viewMode == PdfViewMode.page) {
+      _pageController = PageController(initialPage: _initialPage - 1);
+      _loadDocument();
     }
   }
 
-  /// 读取上次的页码（用于 initialPageNumber）
+  Future<PdfViewMode> _loadViewMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final v = prefs.getString(_kPdfViewModeKey);
+      return v == 'page' ? PdfViewMode.page : PdfViewMode.scroll;
+    } catch (_) {
+      return PdfViewMode.scroll;
+    }
+  }
+
+  Future<void> _saveViewMode(PdfViewMode mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          _kPdfViewModeKey, mode == PdfViewMode.page ? 'page' : 'scroll');
+    } catch (_) {}
+  }
+
   Future<int> _loadSavedPage() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -80,6 +110,106 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
       return page < 1 ? 1 : page;
     } catch (_) {
       return 1;
+    }
+  }
+
+  Future<void> _savePage(int page) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('$_kPdfPagePrefix${widget.book.id}', page);
+    } catch (_) {}
+  }
+
+  /// 加载 PdfDocument（分页模式用）
+  Future<void> _loadDocument() async {
+    if (_document != null || _docLoading) return;
+    setState(() {
+      _docLoading = true;
+      _docError = null;
+    });
+    try {
+      final doc = await PdfDocument.openFile(widget.book.filePath);
+      if (!mounted) {
+        doc.dispose();
+        return;
+      }
+      setState(() {
+        _document = doc;
+        _pageCount = doc.pages.length;
+        _isReady = true;
+        _pageNumber ??= _initialPage;
+        _docLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _docError = '$e';
+        _docLoading = false;
+      });
+    }
+  }
+
+  /// 切换视图模式
+  Future<void> _switchMode(PdfViewMode newMode) async {
+    if (newMode == _viewMode) return;
+    final currentPage = _pageNumber ?? _initialPage;
+    await _savePage(currentPage);
+
+    setState(() {
+      _viewMode = newMode;
+      _showMenu = false;
+    });
+    await _saveViewMode(newMode);
+
+    if (newMode == PdfViewMode.page) {
+      // 分页模式：先确保文档已加载
+      if (_document == null) {
+        await _loadDocument();
+      }
+      // 用真实页数创建 PageController
+      _pageController?.dispose();
+      final maxIndex = _pageCount > 0 ? _pageCount - 1 : 0;
+      final initialIndex = (currentPage - 1).clamp(0, maxIndex);
+      _pageController = PageController(initialPage: initialIndex);
+      setState(() {});
+    } else {
+      // 切回滚动模式：延迟跳转到当前页
+      setState(() {});
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (!mounted) return;
+        try {
+          _scrollController.goToPage(pageNumber: currentPage);
+        } catch (_) {}
+      });
+    }
+  }
+
+  /// 跳转到指定页（自动适配两种模式）
+  void _goToPage(int page) {
+    if (page < 1 || (_pageCount > 0 && page > _pageCount)) return;
+    if (_viewMode == PdfViewMode.page) {
+      _pageController?.animateToPage(
+        page - 1,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    } else {
+      try {
+        _scrollController.goToPage(pageNumber: page);
+      } catch (_) {}
+    }
+  }
+
+  /// 持久化当前页码
+  Future<void> _persistPosition() async {
+    final page = _pageNumber;
+    if (page != null && page > 0) {
+      await _savePage(page);
+      if (_pageCount > 0) {
+        try {
+          BookshelfService.instance.updateReadPosition(widget.book.id, page);
+        } catch (_) {}
+      }
     }
   }
 
@@ -93,68 +223,116 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   }
 
   @override
+  void dispose() {
+    _persistPosition();
+    _pageController?.dispose();
+    _document?.dispose();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (!_initialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
     return Scaffold(
-      body: FutureBuilder<int>(
-        future: _loadSavedPage(),
-        builder: (context, snapshot) {
-          final initialPage = snapshot.data ?? 1;
-          if (!snapshot.hasData) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          return _buildBody(initialPage);
-        },
+      body: Stack(
+        children: [
+          Positioned.fill(child: _buildContent()),
+          if (_showMenu) _buildTopBar(),
+          if (_showMenu) _buildBottomBar(),
+          if (!_showMenu && _isReady) _buildPageHint(),
+        ],
       ),
     );
   }
 
-  Widget _buildBody(int initialPage) {
-    return Stack(
-      children: [
-        // ── PDF 渲染主体 ──
-        Positioned.fill(
-          child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onTap: _toggleMenu,
-            child: PdfViewer.file(
-              widget.book.filePath,
-              controller: _controller,
-              initialPageNumber: initialPage,
-              params: PdfViewerParams(
-                backgroundColor: const Color(0xFF3A3A3A),
-                pageAnchor: PdfPageAnchor.top,
-                enableTextSelection: true,
-                onViewerReady: (document, controller) {
-                  setState(() {
-                    _isReady = true;
-                    _pageCount = document.pages.length;
-                    _pageNumber ??= initialPage;
-                  });
-                },
-                onPageChanged: (pageNumber) {
-                  setState(() {
-                    _pageNumber = pageNumber;
-                    _seekProgress = null;
-                  });
-                  _persistPosition();
-                },
-                errorBannerBuilder: (context, error, stackTrace, documentRef) {
-                  return _buildErrorBanner(error);
-                },
-              ),
-            ),
-          ),
+  Widget _buildContent() {
+    if (_viewMode == PdfViewMode.page) {
+      return _buildPageView();
+    }
+    return _buildScrollView();
+  }
+
+  // ─── 滚动模式 ──────────────────────────────────────────────
+
+  Widget _buildScrollView() {
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: _toggleMenu,
+      child: PdfViewer.file(
+        widget.book.filePath,
+        controller: _scrollController,
+        initialPageNumber: _initialPage,
+        params: PdfViewerParams(
+          backgroundColor: const Color(0xFF3A3A3A),
+          pageAnchor: PdfPageAnchor.top,
+          enableTextSelection: true,
+          onViewerReady: (document, controller) {
+            setState(() {
+              _isReady = true;
+              _pageCount = document.pages.length;
+              _pageNumber ??= _initialPage;
+            });
+          },
+          onPageChanged: (pageNumber) {
+            setState(() {
+              _pageNumber = pageNumber;
+              _seekProgress = null;
+            });
+            _persistPosition();
+          },
+          errorBannerBuilder: (context, error, stackTrace, documentRef) {
+            return _buildErrorBanner(error);
+          },
         ),
+      ),
+    );
+  }
 
-        // ── 顶部菜单栏 ──
-        if (_showMenu) _buildTopBar(),
+  // ─── 分页模式（跟手翻页）──────────────────────────────────
 
-        // ── 底部控制栏 ──
-        if (_showMenu) _buildBottomBar(),
-
-        // ── 页码提示（菜单隐藏时）──
-        if (!_showMenu && _isReady) _buildPageHint(),
-      ],
+  Widget _buildPageView() {
+    if (_docLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_docError != null) {
+      return _buildErrorBanner(_docError!);
+    }
+    final doc = _document;
+    if (doc == null || _pageCount == 0) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final controller = _pageController;
+    if (controller == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: _toggleMenu,
+      child: PageView.builder(
+        controller: controller,
+        itemCount: _pageCount,
+        onPageChanged: (index) {
+          setState(() {
+            _pageNumber = index + 1;
+            _seekProgress = null;
+          });
+          _persistPosition();
+        },
+        itemBuilder: (context, index) {
+          return Container(
+            color: const Color(0xFF3A3A3A),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+            child: PdfPageView(
+              document: doc,
+              pageNumber: index + 1,
+              backgroundColor: const Color(0xFF3A3A3A),
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -196,18 +374,33 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
+                // ── 视图模式切换 ──
+                IconButton(
+                  icon: Icon(
+                    _viewMode == PdfViewMode.page
+                        ? Icons.view_stream
+                        : Icons.menu_book_outlined,
+                    color: Colors.white,
+                  ),
+                  tooltip: _viewMode == PdfViewMode.page
+                      ? '切换为滚动模式'
+                      : '切换为分页模式',
+                  onPressed: () {
+                    _switchMode(_viewMode == PdfViewMode.page
+                        ? PdfViewMode.scroll
+                        : PdfViewMode.page);
+                  },
+                ),
                 IconButton(
                   icon: const Icon(Icons.first_page, color: Colors.white),
                   tooltip: '第一页',
-                  onPressed: _isReady
-                      ? () => _controller.goToPage(pageNumber: 1)
-                      : null,
+                  onPressed: _isReady ? () => _goToPage(1) : null,
                 ),
                 IconButton(
                   icon: const Icon(Icons.last_page, color: Colors.white),
                   tooltip: '最后一页',
                   onPressed: _isReady && _pageCount > 0
-                      ? () => _controller.goToPage(pageNumber: _pageCount)
+                      ? () => _goToPage(_pageCount)
                       : null,
                 ),
               ],
@@ -223,7 +416,8 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   Widget _buildBottomBar() {
     final current = _pageNumber ?? 1;
     final total = _pageCount > 0 ? _pageCount : 1;
-    final progress = _seekProgress ?? (current - 1) / (total - 1 > 0 ? total - 1 : 1);
+    final progress =
+        _seekProgress ?? (current - 1) / (total - 1 > 0 ? total - 1 : 1);
 
     return Positioned(
       bottom: 0,
@@ -242,40 +436,35 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
           top: false,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+            child: Row(
               children: [
-                Row(
-                  children: [
-                    Text(
-                      '$current',
-                      style: const TextStyle(
-                          color: Colors.white, fontWeight: FontWeight.w600),
-                    ),
-                    Expanded(
-                      child: Slider(
-                        value: progress.clamp(0.0, 1.0),
-                        onChanged: _isReady && total > 1
-                            ? (v) {
-                                setState(() => _seekProgress = v);
-                              }
-                            : null,
-                        onChangeEnd: _isReady && total > 1
-                            ? (v) {
-                                final target =
-                                    (v * (total - 1)).round() + 1;
-                                _controller.goToPage(pageNumber: target);
-                              }
-                            : null,
-                        activeColor: Colors.indigoAccent,
-                        inactiveColor: Colors.white24,
-                      ),
-                    ),
-                    Text(
-                      '/ $total',
-                      style: const TextStyle(color: Colors.white70),
-                    ),
-                  ],
+                Text(
+                  '$current',
+                  style: const TextStyle(
+                      color: Colors.white, fontWeight: FontWeight.w600),
+                ),
+                Expanded(
+                  child: Slider(
+                    value: progress.clamp(0.0, 1.0),
+                    onChanged: _isReady && total > 1
+                        ? (v) {
+                            setState(() => _seekProgress = v);
+                          }
+                        : null,
+                    onChangeEnd: _isReady && total > 1
+                        ? (v) {
+                            final target = (v * (total - 1)).round() + 1;
+                            _goToPage(target);
+                            setState(() => _seekProgress = null);
+                          }
+                        : null,
+                    activeColor: Colors.indigoAccent,
+                    inactiveColor: Colors.white24,
+                  ),
+                ),
+                Text(
+                  '/ $total',
+                  style: const TextStyle(color: Colors.white70),
                 ),
               ],
             ),
@@ -292,6 +481,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     final total = _pageCount > 0 ? _pageCount : 0;
     final percent =
         total > 0 ? (current / total * 100).toStringAsFixed(1) : '0.0';
+    final mode = _viewMode == PdfViewMode.page ? '  分页' : '  滚动';
     return Positioned(
       bottom: 16,
       left: 0,
@@ -304,7 +494,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
             borderRadius: BorderRadius.circular(20),
           ),
           child: Text(
-            '$current / $total  ($percent%)',
+            '$current / $total  ($percent%)$mode',
             style: const TextStyle(color: Colors.white, fontSize: 12),
           ),
         ),

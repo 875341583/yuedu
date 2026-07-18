@@ -1,8 +1,6 @@
 /// 书架页面（首页）
 library;
 
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 
@@ -11,6 +9,7 @@ import '../services/bookshelf_service.dart';
 import '../utils/encoding.dart';
 import 'reader_page.dart';
 import 'pdf_reader_page.dart';
+import 'pptx_reader_page.dart';
 
 class BookshelfPage extends StatefulWidget {
   const BookshelfPage({super.key});
@@ -106,20 +105,29 @@ class _BookshelfPageState extends State<BookshelfPage> {
 
   void _openBook(Book book) {
     // PDF 走独立的页面渲染阅读页（pdfrx/PDFium）
+    // PPTX 走独立幻灯片展示页（按页 + 横屏）
     // 其他格式走排版引擎阅读页
-    final page = book.format == BookFormat.pdf
-        ? PdfReaderPage(book: book)
-        : ReaderPage(book: book);
+    Widget page;
+    switch (book.format) {
+      case BookFormat.pdf:
+        page = PdfReaderPage(book: book);
+        break;
+      case BookFormat.pptx:
+        page = PptxReaderPage(book: book);
+        break;
+      default:
+        page = ReaderPage(book: book);
+    }
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => page),
     );
   }
 
-  /// 从本地文件导入TXT/EPUB
+  /// 从本地文件导入TXT/EPUB/PDF/MOBI/DOCX/PPTX/XLSX/OFD
   Future<void> _importFromFile() async {
     final result = await FilePicker.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['txt', 'epub', 'pdf', 'mobi'],
+      allowedExtensions: ['txt', 'epub', 'pdf', 'mobi', 'docx', 'pptx', 'xlsx', 'ofd'],
       allowMultiple: true,
     );
 
@@ -130,16 +138,25 @@ class _BookshelfPageState extends State<BookshelfPage> {
       if (pickedFile.path != null) {
         // Native平台：有实际文件路径
         final path = pickedFile.path!;
-        final isEpub = path.toLowerCase().endsWith('.epub');
-        final isPdf = path.toLowerCase().endsWith('.pdf');
-        final isMobi = path.toLowerCase().endsWith('.mobi');
-        final book = isMobi
-            ? await _service.importMobi(path)
-            : isPdf
-                ? await _service.importPdf(path)
-                : isEpub
-                    ? await _service.importEpub(path)
-                    : await _service.importTxt(path);
+        final lower = path.toLowerCase();
+        Book? book;
+        if (lower.endsWith('.mobi')) {
+          book = await _service.importMobi(path);
+        } else if (lower.endsWith('.pdf')) {
+          book = await _service.importPdf(path);
+        } else if (lower.endsWith('.epub')) {
+          book = await _service.importEpub(path);
+        } else if (lower.endsWith('.docx')) {
+          book = await _service.importDocx(path);
+        } else if (lower.endsWith('.pptx')) {
+          book = await _service.importPptx(path);
+        } else if (lower.endsWith('.xlsx')) {
+          book = await _service.importXlsx(path);
+        } else if (lower.endsWith('.ofd')) {
+          book = await _service.importOfd(path);
+        } else {
+          book = await _service.importTxt(path);
+        }
         if (book != null && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('已导入: ${book.title}'), duration: const Duration(seconds: 2)),
@@ -219,6 +236,28 @@ class _BookCard extends StatelessWidget {
     return '${time.month}/${time.day}';
   }
 
+  /// 格式标签文本
+  static String _formatLabel(BookFormat f) {
+    switch (f) {
+      case BookFormat.txt:
+        return 'TXT';
+      case BookFormat.epub:
+        return 'EPUB';
+      case BookFormat.pdf:
+        return 'PDF';
+      case BookFormat.mobi:
+        return 'MOBI';
+      case BookFormat.docx:
+        return 'DOCX';
+      case BookFormat.pptx:
+        return 'PPTX';
+      case BookFormat.xlsx:
+        return 'XLSX';
+      case BookFormat.ofd:
+        return 'OFD';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final color = Color((book.colorSeed & 0xFFFF) | 0xFF6750A4);
@@ -256,7 +295,7 @@ class _BookCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
-                  book.format == BookFormat.txt ? 'TXT' : book.format == BookFormat.epub ? 'EPUB' : book.format == BookFormat.pdf ? 'PDF' : 'MOBI',
+                  _formatLabel(book.format),
                   style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 10),
                 ),
               ),

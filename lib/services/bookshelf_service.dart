@@ -7,6 +7,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/book.dart';
 import '../utils/encoding.dart';
+import '../utils/docx_text_extractor.dart' deferred as docx;
+import '../utils/xlsx_text_extractor.dart' deferred as xlsx;
+import '../utils/ofd_text_extractor.dart' deferred as ofd;
 import 'epub_parser.dart' deferred as epub;
 import 'pdf_parser.dart';
 import 'mobi_parser.dart';
@@ -248,6 +251,49 @@ class BookshelfService {
     return book;
   }
 
+  /// 导入本地DOCX文件（Native平台）
+  Future<Book?> importDocx(String filePath) async {
+    return _importOfficeFile(filePath, BookFormat.docx);
+  }
+
+  /// 导入本地PPTX文件（Native平台）
+  Future<Book?> importPptx(String filePath) async {
+    return _importOfficeFile(filePath, BookFormat.pptx);
+  }
+
+  /// 导入本地XLSX文件（Native平台）
+  Future<Book?> importXlsx(String filePath) async {
+    return _importOfficeFile(filePath, BookFormat.xlsx);
+  }
+
+  /// 导入本地OFD文件（Native平台）
+  Future<Book?> importOfd(String filePath) async {
+    return _importOfficeFile(filePath, BookFormat.ofd);
+  }
+
+  /// Office/OFD 文件导入公共逻辑
+  Future<Book?> _importOfficeFile(String filePath, BookFormat format) async {
+    final exists = await FileService.fileExists(filePath);
+    if (!exists) return null;
+
+    final fileName = FileService.getFileName(filePath);
+    final title = fileName.replaceAll(RegExp(r'\.\w+$'), '');
+
+    final book = Book(
+      id: 'book_${DateTime.now().millisecondsSinceEpoch}',
+      title: title,
+      author: '未知',
+      filePath: filePath,
+      format: format,
+      colorSeed: title.hashCode & 0xFFFF,
+    );
+
+    _books.add(book);
+    _saveToStorage();
+    _notifyListeners();
+    return book;
+  }
+
   /// 大文件阈值（字节）：超过此值则按需读取，不一次性加载全文
   static const _largeFileThreshold = 500 * 1024; // 500KB
 
@@ -282,6 +328,23 @@ class BookshelfService {
     if (book.format == BookFormat.mobi) {
       return _readMobiContent(book);
     }
+
+    // DOCX格式：解包ZIP并提取XML文本
+    if (book.format == BookFormat.docx) {
+      return _readDocxContent(book);
+    }
+
+    // XLSX格式：解包ZIP并提取单元格文本
+    if (book.format == BookFormat.xlsx) {
+      return _readXlsxContent(book);
+    }
+
+    // OFD格式：解包ZIP并提取页面文本
+    if (book.format == BookFormat.ofd) {
+      return _readOfdContent(book);
+    }
+
+    // PPTX格式：不走全文提取（PptxReaderPage 自行按页加载）
 
     // 先检查内存缓存
     if (_contentCache.containsKey(book.id)) {
@@ -475,13 +538,77 @@ class BookshelfService {
     return _mobiCache[book.id];
   }
 
+  /// 读取DOCX内容（解包ZIP，解析 word/document.xml）
+  Future<String> _readDocxContent(Book book) async {
+    if (_contentCache.containsKey(book.id)) {
+      return _contentCache[book.id]!;
+    }
+    if (book.filePath.isEmpty) return '';
+    final exists = await FileService.fileExists(book.filePath);
+    if (!exists) return '';
+    try {
+      await docx.loadLibrary();
+      final bytes = await FileService.readFileBytes(book.filePath);
+      final text = docx.DocxTextExtractor.extract(bytes);
+      _contentCache[book.id] = text;
+      return text;
+    } catch (e) {
+      if (e is Exception) rethrow;
+      throw Exception('DOCX解析异常: $e');
+    }
+  }
+
+  /// 读取XLSX内容（解包ZIP，解析 sharedStrings + worksheets）
+  Future<String> _readXlsxContent(Book book) async {
+    if (_contentCache.containsKey(book.id)) {
+      return _contentCache[book.id]!;
+    }
+    if (book.filePath.isEmpty) return '';
+    final exists = await FileService.fileExists(book.filePath);
+    if (!exists) return '';
+    try {
+      await xlsx.loadLibrary();
+      final bytes = await FileService.readFileBytes(book.filePath);
+      final text = xlsx.XlsxTextExtractor.extract(bytes);
+      _contentCache[book.id] = text;
+      return text;
+    } catch (e) {
+      if (e is Exception) rethrow;
+      throw Exception('XLSX解析异常: $e');
+    }
+  }
+
+  /// 读取OFD内容（解包ZIP，扫描页面 XML 提取 TextCode）
+  Future<String> _readOfdContent(Book book) async {
+    if (_contentCache.containsKey(book.id)) {
+      return _contentCache[book.id]!;
+    }
+    if (book.filePath.isEmpty) return '';
+    final exists = await FileService.fileExists(book.filePath);
+    if (!exists) return '';
+    try {
+      await ofd.loadLibrary();
+      final bytes = await FileService.readFileBytes(book.filePath);
+      final text = ofd.OfdTextExtractor.extract(bytes);
+      _contentCache[book.id] = text;
+      return text;
+    } catch (e) {
+      if (e is Exception) rethrow;
+      throw Exception('OFD解析异常: $e');
+    }
+  }
+
   /// 判断书籍是否为大文件（需要按需加载）
-  /// EPUB、PDF和MOBI文件不按字节窗口加载，解析后全文在内存中
+  /// EPUB、PDF、MOBI以及 Office/OFD 文件不按字节窗口加载，解析后全文在内存中
   Future<bool> isLargeFile(Book book) async {
     if (book.filePath.isEmpty) return false;
     if (book.format == BookFormat.epub) return false;
     if (book.format == BookFormat.pdf) return false;
     if (book.format == BookFormat.mobi) return false;
+    if (book.format == BookFormat.docx) return false;
+    if (book.format == BookFormat.xlsx) return false;
+    if (book.format == BookFormat.ofd) return false;
+    if (book.format == BookFormat.pptx) return false;
     final size = await getBookFileSize(book);
     return size >= _largeFileThreshold;
   }
