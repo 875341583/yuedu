@@ -38,13 +38,14 @@ android {
         }
     }
 
-    // 输出 APK 文件名格式：阅界-v<versionName>.apk（如 阅界-v0.4.0.apk）
+    // 输出 APK 文件名格式：YueDu-v<versionName>.apk（如 YueDu-v0.4.0.apk）
+    // 注意：APK 文件名必须为 ASCII 字符，因 GitHub Release asset 名限制；
+    //       品牌中文名"阅界"在 AndroidManifest android:label、应用内标题、Release 描述中体现。
     applicationVariants.all { variant ->
         if (variant.buildType.name == "release") {
             variant.outputs.all { output ->
-                // outputFileName 由 defaultConfig.versionName 决定
                 def versionName = variant.versionName
-                outputFileName = "阅界-v${versionName}.apk"
+                outputFileName = "YueDu-v${versionName}.apk"
             }
         }
     }
