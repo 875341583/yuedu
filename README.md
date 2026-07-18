@@ -11,6 +11,8 @@
   ·
   <a href="#功能特性">功能特性</a>
   ·
+  <a href="#插件系统">插件系统</a>
+  ·
   <a href="#构建指南">构建指南</a>
   ·
   <a href="#项目架构">项目架构</a>
@@ -31,7 +33,9 @@
 - 📂 **多格式支持** — TXT、EPUB、PDF、MOBI、DOCX、PPTX、XLSX、OFD（文本类自动识别 GBK / UTF-8 编码）
 - 🗂️ **大文件按需加载** — 64KB 滑动窗口架构，百兆文件也不卡顿
 - 🖖 **跟手翻页** — 除无动画模式外，滑动/覆盖/淡入/翻转 4 种翻页效果均随手指实时联动
+- 📱 **横竖屏自由** — 所有格式阅读页均支持横屏/竖屏切换，PPT/PDF 独立方向控制
 - 📄 **PDF 双视图** — 连续滚动与单页分页两种模式可随时切换，支持任意 PDF（文本型/扫描型/加密）
+- 🧩 **插件系统** — 内置文件分类插件，框架可扩展翻译/高亮/搜索等能力
 - 🌙 **深色模式** — 全局深色主题，护眼夜读
 - 💾 **阅读进度持久化** — 自动保存阅读位置、字号、行高、翻页模式等偏好
 - 🔓 **开源免费** — MPL-2.0 协议，社区版完全免费
@@ -42,9 +46,9 @@
 
 ### Android（首发平台）
 
-从 [Releases](../../releases) 页面下载最新的 `阅界-vX.Y.Z.apk`，直接安装即可。
+从 [Releases](../../releases) 页面下载最新的 `YueDu-vX.Y.Z.apk`，直接安装即可。
 
-> 当前支持 arm64-v8a / armeabi-v7a / x86_64 三种架构，自带 Rust 排版引擎与 PDFium。
+> 文件名因 GitHub API 限制使用 ASCII 格式；当前支持 arm64-v8a / armeabi-v7a / x86_64 三种架构，自带 Rust 排版引擎与 PDFium。
 
 ### Windows / Web（规划中）
 
@@ -74,20 +78,42 @@
 | EPUB | UTF-8 | OPF + NCX 解析 | 全量加载 | 排版引擎重排 |
 | PDF  | — | 按页解析 | Pdfium 页面渲染 | 双视图：滚动 / 分页翻页 |
 | MOBI | Windows-1252 兼容 | 按标题识别 | 全量加载 | PalmDOC RLE + Huffman 解压 |
-| DOCX | — | — | 全量加载 | word/document.xml 文本提取 |
-| XLSX | — | — | 全量加载 | sharedStrings + sheet 单元格 |
-| PPTX | — | — | 逐幻灯片 | 独立展示页，强制横屏 |
-| OFD  | — | — | 全量加载 | 国标 GB/T 33190，扫面 TextCode |
+| DOCX | UTF-8 | — | 全量加载 | word/document.xml 文本提取 |
+| XLSX | UTF-8 | — | 全量加载 | sharedStrings + sheet 单元格 |
+| PPTX | UTF-8 | — | 逐幻灯片 | 独立展示页，横/竖屏可切换 + 5 种翻页模式 |
+| OFD  | UTF-8 | — | 全量加载 | 国标 GB/T 33190，扫描 TextCode |
 
 ### 阅读体验
 
 - **沉浸式阅读** — 隐藏所有 UI 元素，专注内容
-- **跟手翻页** — 4 种动画模式（滑动/覆盖/淡入/翻转）均随手指实时联动，另有无动画模式
-- **PDF 双视图** — 连续滚动与单页分页可随时切换，顶部栏一键切换
-- **PPTX 展示** — 独立页，强制横屏逐页展示幻灯片原始顺序
+- **跟手翻页** — 5 种动画模式（滑动/覆盖/淡入/翻转/无动画）均随手指实时联动，TXT/EPUB/MOBI/DOCX/XLSX/OFD/PPT 通用
+- **横竖屏自由** — 所有格式阅读页均支持横屏/竖屏切换；TXT/EPUB/MOBI/DOCX/XLSX/OFD 跟随系统方向，PPT/PDF 提供独立方向控制（自动/横屏/竖屏三选一）
+- **PDF 双视图** — 连续滚动与单页分页可随时切换，常驻浮动控件栏一键切换视图与方向，页码浮标可点击呼出菜单
+- **PPTX 展示** — 独立页，横/竖屏自由切换，5 种翻页模式按幻灯片原始顺序逐页展示
 - **字号 / 行高调整** — 实时预览，偏好自动保存
 - **深色模式** — 跟随系统或手动切换
 - **阅读进度** — 自动记忆，重新打开恢复位置
+
+---
+
+## 插件系统
+
+阅界内置插件框架，采用「内置代码模块 + 配置驱动」架构：插件代码随 App 编译，用户通过插件中心启用/禁用、配置参数。Flutter AOT 限制下不支持运行时动态加载代码，因此插件以「框架 + 内置模块」方式提供，后续可扩展本地导入与 URL 下载（配置导入已预留）。
+
+### 已有插件
+
+| 插件 | 类型 | 说明 |
+|------|------|------|
+| 文件分类 | 文件管理 | 按格式自动分组书架，支持自定义标签管理书籍，长按书籍打标签，默认启用 |
+
+### 规划中插件
+
+- 翻译（在线 API 划词翻译）
+- 高亮加粗（阅读页标注与笔记）
+- 搜索释义（本地词典 / 在线百科）
+- 本地 AI 小模型（离线推理引擎）
+
+> 插件中心入口位于书架页右上角扩展菜单，可启用/禁用插件、查看设置、导入本地插件配置或通过 URL 下载（预留能力）。
 
 ---
 
@@ -96,16 +122,25 @@
 ```
 yuedu/
 ├── lib/                          # Flutter Dart 代码
-│   ├── main.dart                 # 应用入口
+│   ├── main.dart                 # 应用入口（含 PluginManager 初始化）
 │   ├── models/
 │   │   └── book.dart             # Book / Chapter 数据模型
 │   ├── pages/
-│   │   ├── bookshelf_page.dart   # 书架页（首页）
-│   │   └── reader_page.dart      # 阅读页
+│   │   ├── bookshelf_page.dart   # 书架页（首页，含分类视图与标签管理）
+│   │   ├── reader_page.dart      # 阅读页（TXT/EPUB/MOBI/DOCX/XLSX/OFD）
+│   │   ├── pdf_reader_page.dart  # PDF 阅读页（双视图 + 浮动控件栏）
+│   │   ├── pptx_reader_page.dart # PPT 幻灯片展示页（方向 + 翻页模式）
+│   │   └── plugin_center_page.dart # 插件中心
 │   ├── services/
 │   │   ├── bookshelf_service.dart # 书库管理（导入/存储/读取）
 │   │   ├── epub_parser.dart       # EPUB 解析器
+│   │   ├── tag_service.dart       # 标签服务（插件用）
 │   │   └── file_service.dart      # 文件读取（条件导入）
+│   ├── plugins/                   # 插件系统
+│   │   ├── plugin.dart            # 插件接口与元数据
+│   │   ├── plugin_manager.dart    # 插件管理器（注册/启用/持久化）
+│   │   └── builtin/
+│   │       └── file_category_plugin.dart # 文件分类内置插件
 │   ├── typeset/
 │   │   ├── engine.dart            # 排版引擎接口
 │   │   ├── native_engine.dart     # Rust FFI 引擎（Native）
@@ -136,7 +171,8 @@ yuedu/
 | 排版引擎 | Rust → FFI | Native 平台高性能排版 |
 | Web 引擎 | Dart | 纯 Dart 实现，无需 FFI |
 | 编码处理 | 自研分块解码器 | GBK / UTF-8 自动识别，O(n) 复杂度 |
-| 数据持久化 | SharedPreferences | 阅读进度、设置偏好 |
+| 数据持久化 | SharedPreferences | 阅读进度、设置偏好、插件启用状态 |
+| 插件系统 | 内置模块 + 配置驱动 | 框架可扩展，支持启用/禁用与参数配置 |
 | 开源协议 | MPL-2.0 | 社区版免费，商业版提供增量同步服务 |
 
 ### 排版引擎双轨制
@@ -226,19 +262,25 @@ flutter build web --release
 - [x] EPUB 导入（OPF / NCX 章节目录解析）
 - [x] PDF 导入（pdfrx/PDFium 页面渲染，双视图：连续滚动 + 单页分页）
 - [x] MOBI 导入（PalmDOC RLE + Huffman 解压，修复 compression 与 0x80-0xBF backref 双 bug）
-- [x] DOCX 导入（word/document.xml 文本提取）
-- [x] PPTX 导入（独立展示页，按幻灯片原始顺序逐页 + 强制横屏）
-- [x] XLSX 导入（sharedStrings + worksheets 单元格提取）
-- [x] OFD 导入（GB/T 33190 国标格式，扫描 TextCode）
+- [x] DOCX 导入（word/document.xml 文本提取，UTF-8 解码修复）
+- [x] PPTX 导入（独立展示页，按幻灯片原始顺序逐页，横/竖屏可切换）
+- [x] XLSX 导入（sharedStrings + worksheets 单元格提取，UTF-8 解码修复）
+- [x] OFD 导入（GB/T 33190 国标格式，扫描 TextCode，UTF-8 解码修复）
 - [x] Rust 排版引擎（标点挤压 / 避头尾 / 中西文间距）
 - [x] 精确字体度量（TextPainter 预度量 + FFI 宽度表）
 - [x] 跟手翻页重构（5 种模式：滑动 / 覆盖 / 淡入 / 翻转 / 无动画，除无动画外均随手指实时联动）
 - [x] 阅读体验增强（阅读主题 / 设置面板 / 进度拖拽）
 - [x] 书签与目录（章节跳转 + 键盘快捷键）
 - [x] 大文件 64KB 滑动窗口按需加载
-- [x] 阅读设置持久化（字号 / 行高 / 深色模式 / 翻页模式 / PDF 视图模式）
+- [x] 阅读设置持久化（字号 / 行高 / 深色模式 / 翻页模式 / PDF 视图模式 / PPT 方向与翻页模式）
 - [x] 深色模式
 - [x] Android 首发发布（v0.4.0）
+- [x] 横竖屏自由（所有格式阅读页支持横/竖屏切换，PPT/PDF 独立方向控制：自动/横屏/竖屏三选一）
+- [x] PPT 翻页模式（5 种：滑动/覆盖/淡入/翻转/无动画，与主阅读页一致）
+- [x] PDF 浮动控件栏（常驻视图切换 + 方向切换按钮，页码浮标可点击呼出菜单，首次进入提示）
+- [x] 插件系统框架（Plugin 接口 + PluginManager + 持久化 + 插件中心 UI + 本地导入/URL 下载预留）
+- [x] 文件分类内置插件（按格式分组 + 自定义标签管理书籍，默认启用）
+- [x] v0.4.1 发布（乱码修复 + 横屏方向 + PDF 翻页可见性 + 插件系统）
 
 ### 计划中 📋
 
@@ -248,6 +290,10 @@ flutter build web --release
 - [ ] CRDT 增量同步服务（商业版功能）
 - [ ] CBZ / CBR 漫画格式支持
 - [ ] TTS 朗读
+- [ ] 翻译插件（在线 API 划词翻译）
+- [ ] 高亮加粗插件（阅读页标注与笔记）
+- [ ] 搜索释义插件（本地词典 / 在线百科）
+- [ ] 本地 AI 小模型嵌入（离线推理引擎）
 
 ---
 
@@ -260,6 +306,7 @@ flutter build web --release
 | 本地阅读 | ✅ 全功能 | ✅ 全功能 |
 | 中文排版引擎 | ✅ | ✅ |
 | 多格式支持 | ✅ | ✅ |
+| 插件系统 | ✅ | ✅ |
 | 阅读进度同步 | ❌ | ✅ CRDT 增量同步 |
 | 多设备同步 | ❌ | ✅ |
 | 云端书库 | ❌ | ✅ |
@@ -286,6 +333,7 @@ flutter build web --release
 - [archive](https://pub.dev/packages/archive) — EPUB (ZIP) 解压
 - [gbk_codec](https://pub.dev/packages/gbk_codec) — GBK 编码参考
 - [file_picker](https://pub.dev/packages/file_picker) — 文件选择
+- [pdfrx](https://pub.dev/packages/pdfrx) — PDFium 页面渲染
 
 ---
 

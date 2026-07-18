@@ -5,6 +5,7 @@ import 'pages/reader_page.dart';
 import 'pages/pdf_reader_page.dart';
 import 'models/book.dart';
 import 'services/bookshelf_service.dart';
+import 'plugins/plugin_manager.dart';
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,6 +19,8 @@ void main(List<String> args) async {
   }
 
   await BookshelfService.instance.loadFromStorage();
+  // 初始化插件系统
+  await PluginManager.instance.init();
   runApp(YueDuApp(openBookTitle: openBookTitle));
 }
 

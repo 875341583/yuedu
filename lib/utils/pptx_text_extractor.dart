@@ -11,6 +11,7 @@
 /// 供 PptxReaderPage 按页展示。
 library;
 
+import 'dart:convert';
 import 'package:archive/archive.dart';
 
 class PptxSlides {
@@ -90,7 +91,9 @@ class PptxTextExtractor {
     final data = file.content as dynamic;
     if (data is String) return data;
     if (data is List) {
-      return String.fromCharCodes(List<int>.from(data));
+      final bytes = List<int>.from(data);
+      // pptx 内 XML 强制 UTF-8，必须用 utf8.decode 正确解析多字节中文
+      return utf8.decode(bytes, allowMalformed: true);
     }
     return data.toString();
   }

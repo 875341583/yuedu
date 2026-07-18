@@ -11,6 +11,7 @@
 /// 段落之间用换行分隔，输出纯文本。
 library;
 
+import 'dart:convert';
 import 'package:archive/archive.dart';
 
 class DocxTextExtractor {
@@ -69,8 +70,8 @@ class DocxTextExtractor {
     if (data is String) return data;
     if (data is List) {
       final bytes = List<int>.from(data);
-      // docx 内 XML 强制 UTF-8
-      return String.fromCharCodes(bytes);
+      // docx 内 XML 强制 UTF-8，必须用 utf8.decode 正确解析多字节中文
+      return utf8.decode(bytes, allowMalformed: true);
     }
     return data.toString();
   }

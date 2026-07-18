@@ -19,8 +19,23 @@ import '../services/bookshelf_service.dart';
 /// PDF 视图模式：scroll=连续滚动，page=单页分页翻页
 enum PdfViewMode { scroll, page }
 
+/// 屏幕方向模式
+enum PdfOrientationMode {
+  auto,      // 跟随系统
+  landscape, // 强制横屏
+  portrait,  // 强制竖屏
+}
+
+const _pdfOrientNames = <PdfOrientationMode, String>{
+  PdfOrientationMode.auto: '自动',
+  PdfOrientationMode.landscape: '横屏',
+  PdfOrientationMode.portrait: '竖屏',
+};
+
 const _kPdfViewModeKey = 'yuedu_pdf_view_mode';
 const _kPdfPagePrefix = 'yuedu_pdf_page_';
+const _kPdfOrientKey = 'yuedu_pdf_orient_mode';
+const _kPdfFirstHintKey = 'yuedu_pdf_first_hint_shown';
 
 class PdfReaderPage extends StatefulWidget {
   final Book book;
@@ -56,6 +71,9 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   /// 当前视图模式
   PdfViewMode _viewMode = PdfViewMode.scroll;
 
+  /// 当前方向模式
+  PdfOrientationMode _orientMode = PdfOrientationMode.auto;
+
   /// 分页模式的 PdfDocument（独立于 PdfViewer）
   PdfDocument? _document;
   bool _docLoading = false;
@@ -71,11 +89,15 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   void initState() {
     super.initState();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // PDF 默认跟随系统方向（不强制）
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     _initAsync();
   }
 
   Future<void> _initAsync() async {
     _viewMode = await _loadViewMode();
+    _orientMode = await _loadOrientMode();
+    _applyOrientation(_orientMode);
     _initialPage = await _loadSavedPage();
     if (!mounted) return;
     setState(() => _initialized = true);
@@ -83,6 +105,68 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
       _pageController = PageController(initialPage: _initialPage - 1);
       _loadDocument();
     }
+    // 首次进入提示
+    _maybeShowFirstHint();
+  }
+
+  Future<void> _maybeShowFirstHint() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(_kPdfFirstHintKey) == true) return;
+      await prefs.setBool(_kPdfFirstHintKey, true);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('点击屏幕呼出菜单 · 右下角按钮切换滚动/分页 · 翻页模式随时可切'),
+          duration: Duration(seconds: 4),
+        ),
+      );
+    } catch (_) {}
+  }
+
+  Future<PdfOrientationMode> _loadOrientMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final idx = prefs.getInt(_kPdfOrientKey) ?? 0;
+      return PdfOrientationMode.values[
+          idx.clamp(0, PdfOrientationMode.values.length - 1)];
+    } catch (_) {
+      return PdfOrientationMode.auto;
+    }
+  }
+
+  Future<void> _saveOrientMode(PdfOrientationMode mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_kPdfOrientKey, mode.index);
+    } catch (_) {}
+  }
+
+  void _applyOrientation(PdfOrientationMode mode) {
+    switch (mode) {
+      case PdfOrientationMode.auto:
+        SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+        break;
+      case PdfOrientationMode.landscape:
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+        break;
+      case PdfOrientationMode.portrait:
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+        ]);
+        break;
+    }
+  }
+
+  Future<void> _changeOrientMode(PdfOrientationMode mode) async {
+    if (mode == _orientMode) return;
+    setState(() => _orientMode = mode);
+    _applyOrientation(mode);
+    await _saveOrientMode(mode);
   }
 
   Future<PdfViewMode> _loadViewMode() async {
@@ -227,6 +311,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     _persistPosition();
     _pageController?.dispose();
     _document?.dispose();
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
@@ -243,6 +328,8 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
           if (_showMenu) _buildTopBar(),
           if (_showMenu) _buildBottomBar(),
           if (!_showMenu && _isReady) _buildPageHint(),
+          // 常驻浮动控件栏（不受菜单状态影响，保证随时可切视图）
+          if (_isReady) _buildFloatingControls(),
         ],
       ),
     );
@@ -474,7 +561,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     );
   }
 
-  // ─── 页码浮标 ──────────────────────────────────────────────
+  // ─── 页码浮标（可点击呼出菜单） ─────────────────────────────
 
   Widget _buildPageHint() {
     final current = _pageNumber ?? 1;
@@ -487,18 +574,89 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
       left: 0,
       right: 0,
       child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-          decoration: BoxDecoration(
-            color: Colors.black54,
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Text(
-            '$current / $total  ($percent%)$mode',
-            style: const TextStyle(color: Colors.white, fontSize: 12),
+        child: GestureDetector(
+          onTap: _toggleMenu,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            decoration: BoxDecoration(
+              color: Colors.black54,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              '$current / $total  ($percent%)$mode  · 点击呼出菜单',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
           ),
         ),
       ),
+    );
+  }
+
+  // ─── 常驻浮动控件栏（右下角，始终可见） ────────────────────────
+
+  Widget _buildFloatingControls() {
+    return Positioned(
+      bottom: 16,
+      right: 12,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // 视图模式切换
+          GestureDetector(
+            onTap: () {
+              _switchMode(_viewMode == PdfViewMode.page
+                  ? PdfViewMode.scroll
+                  : PdfViewMode.page);
+            },
+            child: Tooltip(
+              message: _viewMode == PdfViewMode.page
+                  ? '切换为滚动模式'
+                  : '切换为分页模式',
+              child: _floatIcon(_viewMode == PdfViewMode.page
+                  ? Icons.view_stream
+                  : Icons.menu_book_outlined),
+            ),
+          ),
+          const SizedBox(height: 8),
+          // 方向切换
+          PopupMenuButton<PdfOrientationMode>(
+            icon: _floatIcon(Icons.screen_rotation),
+            tooltip: '屏幕方向',
+            onSelected: _changeOrientMode,
+            color: Colors.black87,
+            itemBuilder: (ctx) => PdfOrientationMode.values.map((m) {
+              return PopupMenuItem<PdfOrientationMode>(
+                value: m,
+                child: Row(
+                  children: [
+                    Icon(
+                      _orientMode == m
+                          ? Icons.radio_button_checked
+                          : Icons.radio_button_unchecked,
+                      size: 18,
+                      color: Colors.white,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(_pdfOrientNames[m]!,
+                        style: const TextStyle(color: Colors.white)),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _floatIcon(IconData icon) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        shape: BoxShape.circle,
+      ),
+      child: Icon(icon, color: Colors.white, size: 22),
     );
   }
 
