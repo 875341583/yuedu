@@ -175,7 +175,7 @@ class XlsxTextExtractor {
     final tInlineRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
 
     for (final rowMatch in rowRE.allMatches(xml)) {
-      final rowContent = rowMatch.group(2) ?? '';
+      final rowContent = rowMatch.group(1) ?? '';
       final lineBuf = StringBuffer();
       for (final cellMatch in cellRE.allMatches(rowContent)) {
         final attrs = cellMatch.group(1) ?? '';

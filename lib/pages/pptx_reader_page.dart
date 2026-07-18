@@ -425,11 +425,15 @@ class _PptxReaderPageState extends State<PptxReaderPage>
   // ─── 跟手翻页渲染 ────────────────────────────────────────
 
   Widget _buildPageTurnView(dynamic slides) {
-    final currentPage = _buildSlide(slides.pages[_currentPage - 1]);
+    final currentPage =
+        _buildSlide(slides.pages[_currentPage - 1], key: ValueKey('pptx_page_$_currentPage'));
 
+    // 静态状态：用 Stack 包装保持 widget 树结构稳定。
+    // 避免"动画末帧返回多子 Stack → 静态返回裸 Slide"的 runtimeType 突变，
+    // 触发 Slide 子树重建（含 SingleChildScrollView+Text 列表），造成一帧闪屏。
     if ((_dragExtent == 0 && !_animController.isAnimating) ||
         _turnMode == PptxPageTurnMode.none) {
-      return currentPage;
+      return Stack(children: [currentPage]);
     }
 
     final w = _pageFullWidth;
@@ -441,7 +445,8 @@ class _PptxReaderPageState extends State<PptxReaderPage>
     if (_dragDir != 0) {
       final neighborIndex = _dragDir < 0 ? _currentPage - 2 : _currentPage;
       if (neighborIndex >= 0 && neighborIndex < slides.pageCount) {
-        neighborWidget = _buildSlide(slides.pages[neighborIndex]);
+        neighborWidget = _buildSlide(slides.pages[neighborIndex],
+            key: ValueKey('pptx_page_${neighborIndex + 1}'));
       }
     }
 

@@ -645,26 +645,32 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   }
 
   /// 渲染单个 PDF 页面（PdfPageView 外层包装 + 高亮层）
+  ///
+  /// 用 KeyedSubtree 按 pageNumber 标记，避免翻页末帧从多页 Stack 切回裸单页时
+  /// 触发 PdfPageView 子树重建（pdfrx 重新解码位图），造成一帧白屏闪屏。
   Widget _buildPdfPage(PdfDocument doc, int pageNumber) {
-    return Container(
-      color: const Color(0xFF3A3A3A),
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          return Stack(
-            children: [
-              PdfPageView(
-                document: doc,
-                pageNumber: pageNumber,
-                backgroundColor: const Color(0xFF3A3A3A),
-              ),
-              // 高亮层：渲染当前页已有高亮 + 正在拖动的矩形
-              Positioned.fill(
-                child: _buildHighlightLayer(pageNumber, constraints.biggest),
-              ),
-            ],
-          );
-        },
+    return KeyedSubtree(
+      key: ValueKey('pdf_page_$pageNumber'),
+      child: Container(
+        color: const Color(0xFF3A3A3A),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return Stack(
+              children: [
+                PdfPageView(
+                  document: doc,
+                  pageNumber: pageNumber,
+                  backgroundColor: const Color(0xFF3A3A3A),
+                ),
+                // 高亮层：渲染当前页已有高亮 + 正在拖动的矩形
+                Positioned.fill(
+                  child: _buildHighlightLayer(pageNumber, constraints.biggest),
+                ),
+              ],
+            );
+          },
+        ),
       ),
     );
   }
@@ -863,9 +869,12 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     final current = (_pageNumber ?? 1).clamp(1, _pageCount);
     final currentPage = _buildPdfPage(doc, current);
 
+    // 静态状态：用 Stack 包装保持 widget 树结构稳定。
+    // 避免"动画末帧返回多子 Stack → 静态返回裸 Container"的 runtimeType 突变，
+    // 触发 PdfPageView 子树重建重解码位图造成闪屏。
     if ((_dragExtent == 0 && !_turnController.isAnimating) ||
         _turnMode == PdfPageTurnMode.none) {
-      return currentPage;
+      return Stack(children: [currentPage]);
     }
 
     final w = _pageFullWidth;

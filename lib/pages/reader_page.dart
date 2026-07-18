@@ -668,15 +668,46 @@ class _ReaderPageState extends State<ReaderPage>
           child: Stack(
             children: [
               // ── 主阅读区域 ──
-              GestureDetector(
+              // v0.5.4 修复手势竞争：原 GestureDetector 同时注册 onHorizontalDrag 与 onLongPress，
+              // 用户长按时手指轻微移动 >18px(kTouchSlop) 会被 HorizontalDrag 抢走竞技场，导致「选不中」。
+              // 改用 RawGestureDetector：
+              //   - LongPress deadline 缩短到 400ms（默认 500ms），更快触达选区模式
+              //   - 自定义 _LargerSlopHorizontalDragGestureRecognizer 把水平拖拽初始阈值提到 32px，
+              //     给 LongPress 留出静止识别窗口
+              //   - postAcceptSlopTolerance 放宽到 64px，长按接受后用户拖动扩大选区时不易被取消
+              RawGestureDetector(
                 behavior: HitTestBehavior.opaque,
-                onTapUp: _handleTap,
-                onHorizontalDragStart: _handleDragStart,
-                onHorizontalDragUpdate: _handleDragUpdate,
-                onHorizontalDragEnd: _handleDragEnd,
-                onLongPressStart: _handleLongPressStart,
-                onLongPressMoveUpdate: _handleLongPressUpdate,
-                onLongPressEnd: _handleLongPressEnd,
+                gestures: <Type, GestureRecognizerFactory>{
+                  TapGestureRecognizer:
+                      GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+                    () => TapGestureRecognizer(),
+                    (TapGestureRecognizer instance) {
+                      instance.onTapUp = _handleTap;
+                    },
+                  ),
+                  _LargerSlopHorizontalDragGestureRecognizer:
+                      GestureRecognizerFactoryWithHandlers<
+                          _LargerSlopHorizontalDragGestureRecognizer>(
+                    () => _LargerSlopHorizontalDragGestureRecognizer(),
+                    (_LargerSlopHorizontalDragGestureRecognizer instance) {
+                      instance.onStart = _handleDragStart;
+                      instance.onUpdate = _handleDragUpdate;
+                      instance.onEnd = _handleDragEnd;
+                    },
+                  ),
+                  LongPressGestureRecognizer:
+                      GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+                    () => LongPressGestureRecognizer(
+                      duration: const Duration(milliseconds: 400),
+                      postAcceptSlopTolerance: 64.0,
+                    ),
+                    (LongPressGestureRecognizer instance) {
+                      instance.onLongPressStart = _handleLongPressStart;
+                      instance.onLongPressMoveUpdate = _handleLongPressUpdate;
+                      instance.onLongPressEnd = _handleLongPressEnd;
+                    },
+                  ),
+                },
                 child: Container(
                   color: _theme.bg,
                   padding: EdgeInsets.only(
@@ -1074,8 +1105,7 @@ class _ReaderPageState extends State<ReaderPage>
   // ─── 文本选区：长按手势 ─────────────────────────────────
 
   void _handleLongPressStart(LongPressStartDetails details) {
-    // 大文件不启用选区（跨窗口偏移复杂），直接返回
-    if (_isLargeFile) return;
+    // v0.5.4：移除大文件拦截，让大文件也能长按选中（高亮按当前窗口偏移记录）
     // 插件未启用时不响应
     if (!PluginManager.instance.isEnabled('highlight')) return;
     if (_currentPage == null || _currentPage!.result.glyphs.isEmpty) return;
@@ -1237,11 +1267,24 @@ class _ReaderPageState extends State<ReaderPage>
     if (endChar <= startChar) return;
     final preview = _selectionPreview;
 
+    // v0.5.4 修复：_selectionCharRange 返回的是 page.startOffset + charCount（窗口内偏移）；
+    // 而 _computeHighlightSpansForPage 中匹配用 page.startOffset + _windowStartChar（全局偏移）。
+    // 小文件下 _windowStartChar=0 两者一致，大文件下 _windowStartChar=_byteOffset 必须同步加，
+    // 否则提交的高亮在下次重新渲染（或跨窗口）时会被判为窗口外而消失/错位。
+    final globalStart = startChar + _windowStartChar;
+    final globalEnd = endChar + _windowStartChar;
+
     String? chapterTitle;
     try {
-      // 取起点最近的章节标题
+      // 取起点最近的章节标题。
+      // chapters[i].startOffset 是全文绝对字符偏移；
+      // 小文件 globalStart 本身就是字符偏移可直接比较；
+      // 大文件下 globalStart 语义是「窗口内字符偏移 + 字节偏移」，需用 startChar + windowStartChar*0.4 估算字符偏移
+      final chapterSearchStart = _isLargeFile
+          ? startChar + (_windowStartChar * 0.4).floor()
+          : globalStart;
       for (int i = widget.book.chapters.length - 1; i >= 0; i--) {
-        if (widget.book.chapters[i].startOffset <= startChar) {
+        if (widget.book.chapters[i].startOffset <= chapterSearchStart) {
           chapterTitle = widget.book.chapters[i].title;
           break;
         }
@@ -1250,9 +1293,9 @@ class _ReaderPageState extends State<ReaderPage>
 
     await HighlightService.instance.addHighlight(
       bookId: widget.book.id,
-      startOffset: startChar,
-      endOffset: endChar,
-      position: startChar,
+      startOffset: globalStart,
+      endOffset: globalEnd,
+      position: globalStart,
       preview: preview,
       colorIndex: colorIndex,
       note: note,
@@ -1456,14 +1499,13 @@ class _ReaderPageState extends State<ReaderPage>
   /// 思路：对每个本页高亮，把它的 startOffset/endOffset 投影到当前页的 glyph 索引区间
   List<HighlightSpan> _computeHighlightSpansForPage(_PageData page) {
     if (_highlights.isEmpty || page.result.glyphs.isEmpty) return [];
-    // 小文件模式：高亮的 startOffset/endOffset 是全文字符偏移；
-    // 当前页 _currentPage.startOffset 是文本窗口偏移（小文件=_offset，等于全文偏移）
+    // 高亮的 startOffset/endOffset 是全文字符偏移；
+    // 当前页 _currentPage.startOffset 是文本窗口偏移（小文件=_offset，大文件=窗口内偏移）
     final pageStartGlobal = page.startOffset + _windowStartChar;
     final pageEndGlobal = page.endOffset + _windowStartChar;
     final spans = <HighlightSpan>[];
     for (final h in _highlights) {
-      // 大文件暂时不显示持久化高亮（跨窗口偏移复杂），仅小文件模式启用
-      if (_isLargeFile) continue;
+      // v0.5.4：大文件高亮也按全局偏移显示（提交时已转全局偏移）
       // 区间与当前页相交？
       if (h.startOffset >= pageEndGlobal || h.endOffset <= pageStartGlobal) continue;
       // 投影到页内偏移
@@ -2286,5 +2328,25 @@ class _SelectionToolbar extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 自定义水平拖拽识别器（v0.5.4 手势竞争修复）
+// ─────────────────────────────────────────────────────────────
+
+/// 把 HorizontalDrag 的初始触发阈值从默认 kTouchSlop(≈18px) 提高到 32px，
+/// 让 LongPress（deadline 400ms）在静止状态下有更充裕的识别窗口；
+/// 用户真正想翻页时水平移动通常远超 32px，不影响翻页体验。
+///
+/// 实现原理：Flutter 3.24 中 `HorizontalDragGestureRecognizer
+/// ._hasSufficientGlobalDistanceToAccept` 私有方法内部用
+/// `computeHitSlop(kind, gestureSettings)` 作阈值；gestureSettings 非空时
+/// 优先使用其 touchSlop。父类 `gestureSettings` 是公开可写字段，
+/// 因此在构造时注入 touchSlop=32 即可。
+class _LargerSlopHorizontalDragGestureRecognizer
+    extends HorizontalDragGestureRecognizer {
+  _LargerSlopHorizontalDragGestureRecognizer({super.supportedDevices}) {
+    gestureSettings = const DeviceGestureSettings(touchSlop: 32.0);
   }
 }
