@@ -604,22 +604,30 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         );
 
       case PdfPageTurnMode.fade:
+        // 渐变扫光：移动边界 LinearGradient，soft 随 progress 收缩，
+        // progress=1 时当前页全透、邻居页全显，无末尾闪烁
         final isNext = p < 0;
         final progress = absP.clamp(0.0, 1.0);
+        final edge = 1.0 - progress;
+        final soft = 0.12 * (1.0 - progress);
+        final beginSide =
+            isNext ? Alignment.centerLeft : Alignment.centerRight;
+        final endSide = isNext ? Alignment.centerRight : Alignment.centerLeft;
         return Stack(
           children: [
             ShaderMask(
               shaderCallback: (rect) {
-                final beginSide =
-                    isNext ? Alignment.centerLeft : Alignment.centerRight;
-                final endSide =
-                    isNext ? Alignment.centerRight : Alignment.centerLeft;
+                final s0 = edge.clamp(0.0, 1.0);
+                final s1 = (edge + soft).clamp(0.0, 1.0);
                 return LinearGradient(
                   begin: beginSide,
                   end: endSide,
-                  colors: [
-                    const Color(0xFFFFFFFF),
-                    Color.fromRGBO(255, 255, 255, 1 - progress),
+                  stops: [0.0, s0, s1, 1.0],
+                  colors: const [
+                    Color(0xFFFFFFFF),
+                    Color(0xFFFFFFFF),
+                    Color(0x00FFFFFF),
+                    Color(0x00FFFFFF),
                   ],
                 ).createShader(rect);
               },
@@ -629,16 +637,17 @@ class _PdfReaderPageState extends State<PdfReaderPage>
             if (neighborWidget != null)
               ShaderMask(
                 shaderCallback: (rect) {
-                  final beginSide =
-                      isNext ? Alignment.centerLeft : Alignment.centerRight;
-                  final endSide =
-                      isNext ? Alignment.centerRight : Alignment.centerLeft;
+                  final s0 = (edge - soft).clamp(0.0, 1.0);
+                  final s1 = edge.clamp(0.0, 1.0);
                   return LinearGradient(
                     begin: beginSide,
                     end: endSide,
-                    colors: [
-                      const Color(0x00FFFFFF),
-                      Color.fromRGBO(255, 255, 255, progress),
+                    stops: [0.0, s0, s1, 1.0],
+                    colors: const [
+                      Color(0x00FFFFFF),
+                      Color(0x00FFFFFF),
+                      Color(0xFFFFFFFF),
+                      Color(0xFFFFFFFF),
                     ],
                   ).createShader(rect);
                 },
@@ -649,23 +658,42 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         );
 
       case PdfPageTurnMode.flip:
+        // 翻书式：装订线固定在左侧，右页绕左边缘翻转
         final angle = absP * (math.pi / 2);
-        final align = p > 0 ? Alignment.centerLeft : Alignment.centerRight;
-        return Stack(
-          children: [
-            if (neighborWidget != null)
-              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
-            Transform(
-              alignment: align,
-              transform: Matrix4.identity()
-                ..setEntry(3, 2, 0.002)
-                ..rotateY(angle * (p > 0 ? -1 : 1)),
-              child: Opacity(
-                  opacity: (1 - absP * 0.6).clamp(0.0, 1.0),
-                  child: currentPage),
-            ),
-          ],
-        );
+        if (p < 0) {
+          return Stack(
+            children: [
+              if (neighborWidget != null) neighborWidget,
+              Transform(
+                alignment: Alignment.centerLeft,
+                transform: Matrix4.identity()
+                  ..setEntry(3, 2, 0.002)
+                  ..rotateY(-angle),
+                child: Opacity(
+                  opacity: (1.0 - absP).clamp(0.0, 1.0),
+                  child: currentPage,
+                ),
+              ),
+            ],
+          );
+        } else {
+          return Stack(
+            children: [
+              currentPage,
+              if (neighborWidget != null)
+                Transform(
+                  alignment: Alignment.centerLeft,
+                  transform: Matrix4.identity()
+                    ..setEntry(3, 2, 0.002)
+                    ..rotateY(math.pi / 2 - angle),
+                  child: Opacity(
+                    opacity: absP.clamp(0.0, 1.0),
+                    child: neighborWidget,
+                  ),
+                ),
+            ],
+          );
+        }
 
       case PdfPageTurnMode.slide:
       case PdfPageTurnMode.none:

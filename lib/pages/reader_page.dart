@@ -787,22 +787,30 @@ class _ReaderPageState extends State<ReaderPage>
         );
 
       case PageTurnMode.fade:
-        // 渐变淡入：从拖拽对侧边缘向本侧扫光（由浅入深）
+        // 渐变扫光：用移动边界的 LinearGradient 实现从一侧到另一侧的擦除过渡，
+        // 边界 soft 随 progress 收缩，保证 progress=1 时当前页全透、邻居页全显，无末尾闪烁
         final isNext = p < 0; // 看下一页→邻居从右进；看上一页→邻居从左进
         final progress = absP.clamp(0.0, 1.0);
+        final edge = 1.0 - progress; // 擦除边界 1→0
+        final soft = 0.12 * (1.0 - progress); // 软边宽度，末尾归零
+        final beginSide = isNext ? Alignment.centerLeft : Alignment.centerRight;
+        final endSide = isNext ? Alignment.centerRight : Alignment.centerLeft;
         return Stack(
           children: [
             ShaderMask(
               shaderCallback: (rect) {
-                // 当前页：从拖拽起始侧开始变透明
-                final beginSide = isNext ? Alignment.centerLeft : Alignment.centerRight;
-                final endSide = isNext ? Alignment.centerRight : Alignment.centerLeft;
+                // 当前页：[0, edge] 不透，[edge, edge+soft] 渐透，之后全透
+                final s0 = edge.clamp(0.0, 1.0);
+                final s1 = (edge + soft).clamp(0.0, 1.0);
                 return LinearGradient(
                   begin: beginSide,
                   end: endSide,
-                  colors: [
-                    const Color(0xFFFFFFFF),
-                    Color.fromRGBO(255, 255, 255, 1 - progress),
+                  stops: [0.0, s0, s1, 1.0],
+                  colors: const [
+                    Color(0xFFFFFFFF),
+                    Color(0xFFFFFFFF),
+                    Color(0x00FFFFFF),
+                    Color(0x00FFFFFF),
                   ],
                 ).createShader(rect);
               },
@@ -812,15 +820,18 @@ class _ReaderPageState extends State<ReaderPage>
             if (neighborWidget != null)
               ShaderMask(
                 shaderCallback: (rect) {
-                  // 邻居页：从拖拽对侧边缘开始显现
-                  final beginSide = isNext ? Alignment.centerLeft : Alignment.centerRight;
-                  final endSide = isNext ? Alignment.centerRight : Alignment.centerLeft;
+                  // 邻居页：[0, edge-soft] 全透，[edge-soft, edge] 渐显，之后不透
+                  final s0 = (edge - soft).clamp(0.0, 1.0);
+                  final s1 = edge.clamp(0.0, 1.0);
                   return LinearGradient(
                     begin: beginSide,
                     end: endSide,
-                    colors: [
-                      const Color(0x00FFFFFF),
-                      Color.fromRGBO(255, 255, 255, progress),
+                    stops: [0.0, s0, s1, 1.0],
+                    colors: const [
+                      Color(0x00FFFFFF),
+                      Color(0x00FFFFFF),
+                      Color(0xFFFFFFFF),
+                      Color(0xFFFFFFFF),
                     ],
                   ).createShader(rect);
                 },
@@ -831,25 +842,44 @@ class _ReaderPageState extends State<ReaderPage>
         );
 
       case PageTurnMode.flip:
-        // 3D翻转：当前页绕拖拽起始边缘翻转露出相邻页
-        // 向右拖(p>0)看上一页：当前页绕左边缘向右翻出（rotateY 负向）
-        // 向左拖(p<0)看下一页：当前页绕右边缘向左翻出（rotateY 正向）
+        // 翻书式：装订线固定在左侧，右页绕左边缘翻转
+        // 下一页(p<0)：当前页绕左边缘向左翻起，露出下方下一页
+        // 上一页(p>0)：上一页从装订线翻回覆盖当前页
         final angle = absP * (math.pi / 2);
-        final align = p > 0 ? Alignment.centerLeft : Alignment.centerRight;
-        return Stack(
-          children: [
-            if (neighborWidget != null)
-              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
-            Transform(
-              alignment: align,
-              transform: Matrix4.identity()
-                ..setEntry(3, 2, 0.002)
-                ..rotateY(angle * (p > 0 ? -1 : 1)),
-              child:
-                  Opacity(opacity: (1 - absP * 0.6).clamp(0.0, 1.0), child: currentPage),
-            ),
-          ],
-        );
+        if (p < 0) {
+          return Stack(
+            children: [
+              if (neighborWidget != null) neighborWidget,
+              Transform(
+                alignment: Alignment.centerLeft,
+                transform: Matrix4.identity()
+                  ..setEntry(3, 2, 0.002)
+                  ..rotateY(-angle),
+                child: Opacity(
+                  opacity: (1.0 - absP).clamp(0.0, 1.0),
+                  child: currentPage,
+                ),
+              ),
+            ],
+          );
+        } else {
+          return Stack(
+            children: [
+              currentPage,
+              if (neighborWidget != null)
+                Transform(
+                  alignment: Alignment.centerLeft,
+                  transform: Matrix4.identity()
+                    ..setEntry(3, 2, 0.002)
+                    ..rotateY(math.pi / 2 - angle),
+                  child: Opacity(
+                    opacity: absP.clamp(0.0, 1.0),
+                    child: neighborWidget,
+                  ),
+                ),
+            ],
+          );
+        }
 
       case PageTurnMode.none:
         return currentPage;
@@ -1479,17 +1509,18 @@ class _ReaderPageState extends State<ReaderPage>
   int _hitTestGlyph(Offset localPos) {
     if (_currentPage == null || _currentPage!.result.glyphs.isEmpty) return -1;
     final glyphs = _currentPage!.result.glyphs;
-    // y 在 [glyph.y - fontSize*0.85, glyph.y + fontSize*0.15) 区间视为本行
-    final fontSize = _config.fontSize;
+    // glyph.y 是行盒顶部（引擎 y 从 0 按 lineHeight 递增），行盒=[g.y, g.y+lineH)，
+    // 行中心取 g.y + lineH/2 用于就近命中
+    final lineH = _config.fontSize * _config.lineHeightRatio;
     // 先找最近的行
     int bestIdx = -1;
     double bestDist = 1e18;
     for (int i = 0; i < glyphs.length; i++) {
       final g = glyphs[i];
       if (g.isCjkLatinSpacing || g.char == '\n') continue;
-      // 取字符中心点
+      // 行盒中心：g.y 是行顶，中心在 g.y + lineH/2
       final cx = g.x + g.width / 2;
-      final cy = g.y - fontSize * 0.35;
+      final cy = g.y + lineH / 2;
       final d = (cx - localPos.dx) * (cx - localPos.dx) +
           (cy - localPos.dy) * (cy - localPos.dy);
       if (d < bestDist) {
