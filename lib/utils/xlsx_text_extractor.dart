@@ -16,11 +16,24 @@ import 'package:archive/archive.dart';
 
 class XlsxTextExtractor {
   static String extract(List<int> bytes) {
+    // 文件头检测：区分 .xlsx（ZIP，PK\x03\x04）与 .xls（OLE2，D0CF11E0）
+    if (bytes.length < 4) {
+      throw Exception('文件过小，不是有效的 XLSX 文件');
+    }
+    // OLE2 复合文档头（.xls 旧格式）
+    if (bytes[0] == 0xD0 && bytes[1] == 0xCF && bytes[2] == 0x11 && bytes[3] == 0xE0) {
+      throw Exception('此文件是旧版 .xls 格式（二进制），请在电脑上用 Excel 另存为 .xlsx 格式后再导入');
+    }
+    // ZIP 头检测
+    if (!(bytes[0] == 0x50 && bytes[1] == 0x4B)) {
+      throw Exception('文件格式不正确（不是有效的 .xlsx 压缩包），请确认文件未损坏');
+    }
+
     final Archive archive;
     try {
       archive = ZipDecoder().decodeBytes(bytes);
     } catch (e) {
-      throw Exception('无效的 XLSX 文件：解压失败 ($e)');
+      throw Exception('XLSX 解压失败，文件可能已损坏或加密 ($e)');
     }
 
     // 1. 解析 sharedStrings
@@ -78,7 +91,8 @@ class XlsxTextExtractor {
       }
     }
     if (buffer.isEmpty) {
-      throw Exception('XLSX 文件无可读单元格');
+      // 空表格不抛异常，返回友好提示（纯图表/图片型表格）
+      return '（此表格无可读文本单元格，可能为纯图表或图片型表格）';
     }
     return buffer.toString();
   }

@@ -280,7 +280,7 @@ class _ReaderPageState extends State<ReaderPage>
     super.initState();
     _turnController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 260),
+      duration: const Duration(milliseconds: 220),
     );
     _turnController.addListener(_onTurnAnimTick);
     _turnController.addStatusListener(_onTurnAnimStatus);
@@ -787,17 +787,53 @@ class _ReaderPageState extends State<ReaderPage>
         );
 
       case PageTurnMode.fade:
-        // 淡入淡出：相邻页淡入，当前页淡出
+        // 渐变淡入：从拖拽对侧边缘向本侧扫光（由浅入深）
+        final isNext = p < 0; // 看下一页→邻居从右进；看上一页→邻居从左进
+        final progress = absP.clamp(0.0, 1.0);
         return Stack(
           children: [
-            Opacity(opacity: (1 - absP).clamp(0.0, 1.0), child: currentPage),
+            ShaderMask(
+              shaderCallback: (rect) {
+                // 当前页：从拖拽起始侧开始变透明
+                final beginSide = isNext ? Alignment.centerLeft : Alignment.centerRight;
+                final endSide = isNext ? Alignment.centerRight : Alignment.centerLeft;
+                return LinearGradient(
+                  begin: beginSide,
+                  end: endSide,
+                  colors: [
+                    const Color(0xFFFFFFFF),
+                    Color.fromRGBO(255, 255, 255, 1 - progress),
+                  ],
+                ).createShader(rect);
+              },
+              blendMode: BlendMode.modulate,
+              child: currentPage,
+            ),
             if (neighborWidget != null)
-              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
+              ShaderMask(
+                shaderCallback: (rect) {
+                  // 邻居页：从拖拽对侧边缘开始显现
+                  final beginSide = isNext ? Alignment.centerLeft : Alignment.centerRight;
+                  final endSide = isNext ? Alignment.centerRight : Alignment.centerLeft;
+                  return LinearGradient(
+                    begin: beginSide,
+                    end: endSide,
+                    colors: [
+                      const Color(0x00FFFFFF),
+                      Color.fromRGBO(255, 255, 255, progress),
+                    ],
+                  ).createShader(rect);
+                },
+                blendMode: BlendMode.modulate,
+                child: neighborWidget,
+              ),
           ],
         );
 
       case PageTurnMode.flip:
-        // 3D翻转：当前页绕拖拽起始边缘旋转淡出，相邻页淡入
+        // 3D翻转：当前页绕拖拽起始边缘翻转露出相邻页
+        // 向右拖(p>0)看上一页：当前页绕左边缘向右翻出（rotateY 负向）
+        // 向左拖(p<0)看下一页：当前页绕右边缘向左翻出（rotateY 正向）
         final angle = absP * (math.pi / 2);
         final align = p > 0 ? Alignment.centerLeft : Alignment.centerRight;
         return Stack(
@@ -808,7 +844,7 @@ class _ReaderPageState extends State<ReaderPage>
               alignment: align,
               transform: Matrix4.identity()
                 ..setEntry(3, 2, 0.002)
-                ..rotateY(angle * (p > 0 ? 1 : -1)),
+                ..rotateY(angle * (p > 0 ? -1 : 1)),
               child:
                   Opacity(opacity: (1 - absP * 0.6).clamp(0.0, 1.0), child: currentPage),
             ),
@@ -842,15 +878,50 @@ class _ReaderPageState extends State<ReaderPage>
     final dx = details.localPosition.dx;
 
     if (dx < screenWidth / 3) {
-      _prevPage();
+      _animateTurnToPage(-1); // 上一页，带翻页动画
     } else if (dx > screenWidth * 2 / 3) {
-      _nextPage();
+      _animateTurnToPage(1); // 下一页，带翻页动画
     } else {
       setState(() {
         _showMenu = !_showMenu;
         if (!_showMenu) _showSettings = false;
       });
     }
+  }
+
+  /// 点击翻页：从静止状态启动一次完整翻页动画
+  /// dir: -1=上一页, 1=下一页
+  void _animateTurnToPage(int dir) {
+    if (_pageMode == PageTurnMode.none) {
+      // 无动画模式直接切
+      if (dir < 0) {
+        _prevPage();
+      } else {
+        _nextPage();
+      }
+      return;
+    }
+    if (_turnController.isAnimating) return;
+    if (_isDragging) return;
+    _dragDir = dir;
+    _dragNeighborPage = _prepareNeighborPage(dir);
+    if (_dragNeighborPage == null) {
+      // 无相邻页：直接切
+      if (dir < 0) {
+        _prevPage();
+      } else {
+        _nextPage();
+      }
+      return;
+    }
+    final w = _pageFullWidth;
+    setState(() {
+      _dragExtent = 0;
+    });
+    _animFromExtent = 0;
+    _animTargetExtent = dir < 0 ? w : -w;
+    _turnController.value = 0;
+    _turnController.forward();
   }
 
   // ─── 跟手翻页：手势处理 ───────────────────────────────────

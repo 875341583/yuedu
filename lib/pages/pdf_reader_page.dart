@@ -8,6 +8,7 @@
 /// 与排版阅读页（ReaderPage）解耦：PDF 书走本页，其他格式仍走排版引擎。
 library;
 
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:pdfrx/pdfrx.dart';
@@ -18,6 +19,23 @@ import '../services/bookshelf_service.dart';
 
 /// PDF 视图模式：scroll=连续滚动，page=单页分页翻页
 enum PdfViewMode { scroll, page }
+
+/// 分页模式下的翻页效果（和 ReaderPage 一致）
+enum PdfPageTurnMode {
+  slide, // 滑动（PageView 原生跟手）
+  cover, // 覆盖
+  fade,  // 淡入（渐变扫光）
+  flip,  // 3D翻转
+  none,  // 无动画
+}
+
+const _pdfTurnModeNames = <PdfPageTurnMode, String>{
+  PdfPageTurnMode.slide: '滑动',
+  PdfPageTurnMode.cover: '覆盖',
+  PdfPageTurnMode.fade: '淡入',
+  PdfPageTurnMode.flip: '翻转',
+  PdfPageTurnMode.none: '无动画',
+};
 
 /// 屏幕方向模式
 enum PdfOrientationMode {
@@ -36,6 +54,7 @@ const _kPdfViewModeKey = 'yuedu_pdf_view_mode';
 const _kPdfPagePrefix = 'yuedu_pdf_page_';
 const _kPdfOrientKey = 'yuedu_pdf_orient_mode';
 const _kPdfFirstHintKey = 'yuedu_pdf_first_hint_shown';
+const _kPdfTurnModeKey = 'yuedu_pdf_turn_mode';
 
 class PdfReaderPage extends StatefulWidget {
   final Book book;
@@ -46,7 +65,8 @@ class PdfReaderPage extends StatefulWidget {
   State<PdfReaderPage> createState() => _PdfReaderPageState();
 }
 
-class _PdfReaderPageState extends State<PdfReaderPage> {
+class _PdfReaderPageState extends State<PdfReaderPage>
+    with SingleTickerProviderStateMixin {
   // 滚动模式控制器
   final PdfViewerController _scrollController = PdfViewerController();
 
@@ -74,6 +94,18 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   /// 当前方向模式
   PdfOrientationMode _orientMode = PdfOrientationMode.auto;
 
+  /// 分页模式下的翻页效果
+  PdfPageTurnMode _turnMode = PdfPageTurnMode.slide;
+
+  // ─── 跟手翻页状态（非 slide 分页模式）─────────────────────
+  double _dragExtent = 0;
+  bool _isDragging = false;
+  late final AnimationController _turnController;
+  double _animFromExtent = 0;
+  double _animTargetExtent = 0;
+  double _pageFullWidth = 0;
+  int _dragDir = 0;
+
   /// 分页模式的 PdfDocument（独立于 PdfViewer）
   PdfDocument? _document;
   bool _docLoading = false;
@@ -91,12 +123,19 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     // PDF 默认跟随系统方向（不强制）
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    _turnController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 220),
+    );
+    _turnController.addListener(_onTurnAnimTick);
+    _turnController.addStatusListener(_onTurnAnimStatus);
     _initAsync();
   }
 
   Future<void> _initAsync() async {
     _viewMode = await _loadViewMode();
     _orientMode = await _loadOrientMode();
+    _turnMode = await _loadTurnMode();
     _applyOrientation(_orientMode);
     _initialPage = await _loadSavedPage();
     if (!mounted) return;
@@ -187,6 +226,43 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     } catch (_) {}
   }
 
+  Future<PdfPageTurnMode> _loadTurnMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final idx = prefs.getInt(_kPdfTurnModeKey) ?? 0;
+      return PdfPageTurnMode.values[
+          idx.clamp(0, PdfPageTurnMode.values.length - 1)];
+    } catch (_) {
+      return PdfPageTurnMode.slide;
+    }
+  }
+
+  Future<void> _saveTurnMode(PdfPageTurnMode mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_kPdfTurnModeKey, mode.index);
+    } catch (_) {}
+  }
+
+  Future<void> _changeTurnMode(PdfPageTurnMode mode) async {
+    if (mode == _turnMode) return;
+    setState(() {
+      _turnMode = mode;
+      _showMenu = false;
+      _dragExtent = 0;
+      _dragDir = 0;
+    });
+    await _saveTurnMode(mode);
+    if (mode == PdfPageTurnMode.slide) {
+      // 切回 slide：跳到当前页
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (!mounted) return;
+        final cur = (_pageNumber ?? 1) - 1;
+        _pageController?.jumpToPage(cur);
+      });
+    }
+  }
+
   Future<int> _loadSavedPage() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -272,15 +348,45 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
   void _goToPage(int page) {
     if (page < 1 || (_pageCount > 0 && page > _pageCount)) return;
     if (_viewMode == PdfViewMode.page) {
-      _pageController?.animateToPage(
-        page - 1,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOut,
-      );
+      if (_turnMode == PdfPageTurnMode.slide) {
+        _pageController?.animateToPage(
+          page - 1,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      } else {
+        // 非 slide 模式直接切（滑块跳页不走动画）
+        setState(() {
+          _pageNumber = page;
+          _dragExtent = 0;
+          _dragDir = 0;
+        });
+        _persistPosition();
+      }
     } else {
       try {
         _scrollController.goToPage(pageNumber: page);
       } catch (_) {}
+    }
+  }
+
+  void _nextPage() {
+    final current = _pageNumber ?? 1;
+    if (current >= _pageCount) return;
+    if (_viewMode == PdfViewMode.page && _turnMode != PdfPageTurnMode.slide) {
+      _animateTurnToPage(1);
+    } else {
+      _goToPage(current + 1);
+    }
+  }
+
+  void _prevPage() {
+    final current = _pageNumber ?? 1;
+    if (current <= 1) return;
+    if (_viewMode == PdfViewMode.page && _turnMode != PdfPageTurnMode.slide) {
+      _animateTurnToPage(-1);
+    } else {
+      _goToPage(current - 1);
     }
   }
 
@@ -311,6 +417,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     _persistPosition();
     _pageController?.dispose();
     _document?.dispose();
+    _turnController.dispose();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
@@ -378,7 +485,7 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     );
   }
 
-  // ─── 分页模式（跟手翻页）──────────────────────────────────
+  // ─── 分页模式 ──────────────────────────────────────────────
 
   Widget _buildPageView() {
     if (_docLoading) {
@@ -391,36 +498,306 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     if (doc == null || _pageCount == 0) {
       return const Center(child: CircularProgressIndicator());
     }
-    final controller = _pageController;
-    if (controller == null) {
-      return const Center(child: CircularProgressIndicator());
+    // slide 模式：PageView 原生跟手
+    if (_turnMode == PdfPageTurnMode.slide) {
+      final controller = _pageController;
+      if (controller == null) {
+        return const Center(child: CircularProgressIndicator());
+      }
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: _toggleMenu,
+        child: PageView.builder(
+          controller: controller,
+          itemCount: _pageCount,
+          onPageChanged: (index) {
+            setState(() {
+              _pageNumber = index + 1;
+              _seekProgress = null;
+            });
+            _persistPosition();
+          },
+          itemBuilder: (context, index) {
+            return _buildPdfPage(doc, index + 1);
+          },
+        ),
+      );
     }
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onTap: _toggleMenu,
-      child: PageView.builder(
-        controller: controller,
-        itemCount: _pageCount,
-        onPageChanged: (index) {
-          setState(() {
-            _pageNumber = index + 1;
-            _seekProgress = null;
-          });
-          _persistPosition();
-        },
-        itemBuilder: (context, index) {
-          return Container(
-            color: const Color(0xFF3A3A3A),
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
-            child: PdfPageView(
-              document: doc,
-              pageNumber: index + 1,
-              backgroundColor: const Color(0xFF3A3A3A),
-            ),
-          );
-        },
+    // 非 slide 模式：跟手 Stack + Transform
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _pageFullWidth = constraints.maxWidth;
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTapUp: _handleTapUp,
+          onHorizontalDragStart: _handleDragStart,
+          onHorizontalDragUpdate: _handleDragUpdate,
+          onHorizontalDragEnd: _handleDragEnd,
+          child: _buildPageTurnView(doc),
+        );
+      },
+    );
+  }
+
+  /// 渲染单个 PDF 页面（PdfPageView 外层包装）
+  Widget _buildPdfPage(PdfDocument doc, int pageNumber) {
+    return Container(
+      color: const Color(0xFF3A3A3A),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+      child: PdfPageView(
+        document: doc,
+        pageNumber: pageNumber,
+        backgroundColor: const Color(0xFF3A3A3A),
       ),
     );
+  }
+
+  /// 点击翻页或切菜单（屏幕三分法）
+  void _handleTapUp(TapUpDetails details) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final dx = details.localPosition.dx;
+    if (dx < screenWidth / 3) {
+      _prevPage();
+    } else if (dx > screenWidth * 2 / 3) {
+      _nextPage();
+    } else {
+      _toggleMenu();
+    }
+  }
+
+  // ─── 跟手翻页渲染（非 slide 模式）──────────────────────────
+
+  Widget _buildPageTurnView(PdfDocument doc) {
+    final current = (_pageNumber ?? 1).clamp(1, _pageCount);
+    final currentPage = _buildPdfPage(doc, current);
+
+    if ((_dragExtent == 0 && !_turnController.isAnimating) ||
+        _turnMode == PdfPageTurnMode.none) {
+      return currentPage;
+    }
+
+    final w = _pageFullWidth;
+    final p = (_dragExtent / w).clamp(-1.0, 1.0);
+    final absP = p.abs();
+
+    Widget? neighborWidget;
+    if (_dragDir != 0) {
+      final neighborPage = _dragDir < 0 ? current - 1 : current + 1;
+      if (neighborPage >= 1 && neighborPage <= _pageCount) {
+        neighborWidget = _buildPdfPage(doc, neighborPage);
+      }
+    }
+
+    final neighborBase = p > 0 ? -w : w;
+
+    switch (_turnMode) {
+      case PdfPageTurnMode.cover:
+        return Stack(
+          children: [
+            currentPage,
+            if (neighborWidget != null)
+              Transform.translate(
+                offset: Offset(neighborBase + _dragExtent, 0),
+                child: neighborWidget,
+              ),
+          ],
+        );
+
+      case PdfPageTurnMode.fade:
+        final isNext = p < 0;
+        final progress = absP.clamp(0.0, 1.0);
+        return Stack(
+          children: [
+            ShaderMask(
+              shaderCallback: (rect) {
+                final beginSide =
+                    isNext ? Alignment.centerLeft : Alignment.centerRight;
+                final endSide =
+                    isNext ? Alignment.centerRight : Alignment.centerLeft;
+                return LinearGradient(
+                  begin: beginSide,
+                  end: endSide,
+                  colors: [
+                    const Color(0xFFFFFFFF),
+                    Color.fromRGBO(255, 255, 255, 1 - progress),
+                  ],
+                ).createShader(rect);
+              },
+              blendMode: BlendMode.modulate,
+              child: currentPage,
+            ),
+            if (neighborWidget != null)
+              ShaderMask(
+                shaderCallback: (rect) {
+                  final beginSide =
+                      isNext ? Alignment.centerLeft : Alignment.centerRight;
+                  final endSide =
+                      isNext ? Alignment.centerRight : Alignment.centerLeft;
+                  return LinearGradient(
+                    begin: beginSide,
+                    end: endSide,
+                    colors: [
+                      const Color(0x00FFFFFF),
+                      Color.fromRGBO(255, 255, 255, progress),
+                    ],
+                  ).createShader(rect);
+                },
+                blendMode: BlendMode.modulate,
+                child: neighborWidget,
+              ),
+          ],
+        );
+
+      case PdfPageTurnMode.flip:
+        final angle = absP * (math.pi / 2);
+        final align = p > 0 ? Alignment.centerLeft : Alignment.centerRight;
+        return Stack(
+          children: [
+            if (neighborWidget != null)
+              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
+            Transform(
+              alignment: align,
+              transform: Matrix4.identity()
+                ..setEntry(3, 2, 0.002)
+                ..rotateY(angle * (p > 0 ? -1 : 1)),
+              child: Opacity(
+                  opacity: (1 - absP * 0.6).clamp(0.0, 1.0),
+                  child: currentPage),
+            ),
+          ],
+        );
+
+      case PdfPageTurnMode.slide:
+      case PdfPageTurnMode.none:
+        return currentPage;
+    }
+  }
+
+  // ─── 跟手翻页：手势处理 ───────────────────────────────────
+
+  void _handleDragStart(DragStartDetails details) {
+    _isDragging = true;
+    if (_turnController.isAnimating) {
+      _turnController.stop();
+    }
+    _dragDir = 0;
+  }
+
+  void _handleDragUpdate(DragUpdateDetails details) {
+    if (!_isDragging) return;
+    final delta = details.primaryDelta ?? 0;
+    var next = _dragExtent + delta;
+    final w = _pageFullWidth;
+    final current = _pageNumber ?? 1;
+    if (_dragDir == 0 && next.abs() > 6) {
+      _dragDir = next > 0 ? -1 : 1;
+    }
+    if (_dragDir == -1) {
+      next = next.clamp(0.0, w);
+    } else if (_dragDir == 1) {
+      next = next.clamp(-w, 0.0);
+    } else {
+      next = next.clamp(-w, w);
+    }
+    // 边界橡皮筋
+    final neighborPage = _dragDir < 0 ? current - 1 : current + 1;
+    if (_dragDir != 0 && (neighborPage < 1 || neighborPage > _pageCount)) {
+      next = next * 0.32;
+    }
+    setState(() {
+      _dragExtent = next;
+    });
+  }
+
+  void _handleDragEnd(DragEndDetails details) {
+    if (!_isDragging) return;
+    _isDragging = false;
+    final velocity = details.primaryVelocity ?? 0;
+    final w = _pageFullWidth;
+    final current = _pageNumber ?? 1;
+
+    final neighborPage = _dragDir < 0 ? current - 1 : current + 1;
+    final hasNeighbor =
+        _dragDir != 0 && neighborPage >= 1 && neighborPage <= _pageCount;
+    if (!hasNeighbor || _dragDir == 0) {
+      _startTurnAnim(0);
+      return;
+    }
+
+    bool shouldTurn;
+    if (_dragDir == -1) {
+      shouldTurn = _dragExtent > w * 0.33 || velocity > 320;
+    } else {
+      shouldTurn = _dragExtent.abs() > w * 0.33 || velocity < -320;
+    }
+    final target = shouldTurn ? (_dragDir == -1 ? w : -w) : 0.0;
+    _startTurnAnim(target);
+  }
+
+  void _startTurnAnim(double target) {
+    _animFromExtent = _dragExtent;
+    _animTargetExtent = target;
+    _turnController.value = 0;
+    _turnController.forward();
+  }
+
+  void _onTurnAnimTick() {
+    final t = _turnController.value;
+    setState(() {
+      _dragExtent =
+          _animFromExtent + (_animTargetExtent - _animFromExtent) * t;
+    });
+  }
+
+  void _onTurnAnimStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed) return;
+    _turnController.value = 0;
+    if (_animTargetExtent.abs() > _pageFullWidth * 0.5) {
+      final dir = _animTargetExtent > 0 ? -1 : 1;
+      final current = _pageNumber ?? 1;
+      final newPage = (current + dir).clamp(1, _pageCount);
+      setState(() {
+        _pageNumber = newPage;
+        _dragExtent = 0;
+        _dragDir = 0;
+        _seekProgress = null;
+      });
+      _persistPosition();
+    } else {
+      setState(() {
+        _dragExtent = 0;
+        _dragDir = 0;
+      });
+    }
+  }
+
+  /// 点击/按钮翻页（非 slide 模式带动画）
+  void _animateTurnToPage(int dir) {
+    if (_turnMode == PdfPageTurnMode.none) {
+      final current = _pageNumber ?? 1;
+      final newPage = (current + dir).clamp(1, _pageCount);
+      setState(() {
+        _pageNumber = newPage;
+        _dragExtent = 0;
+        _dragDir = 0;
+      });
+      _persistPosition();
+      return;
+    }
+    if (_turnController.isAnimating) return;
+    if (_isDragging) return;
+    final current = _pageNumber ?? 1;
+    final target = current + dir;
+    if (target < 1 || target > _pageCount) return;
+    _dragDir = dir;
+    final w = _pageFullWidth;
+    setState(() {
+      _dragExtent = 0;
+    });
+    _animFromExtent = 0;
+    _animTargetExtent = dir < 0 ? w : -w;
+    _turnController.value = 0;
+    _turnController.forward();
   }
 
   // ─── 顶部栏 ────────────────────────────────────────────────
@@ -568,7 +945,9 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
     final total = _pageCount > 0 ? _pageCount : 0;
     final percent =
         total > 0 ? (current / total * 100).toStringAsFixed(1) : '0.0';
-    final mode = _viewMode == PdfViewMode.page ? '  分页' : '  滚动';
+    final mode = _viewMode == PdfViewMode.page
+        ? '  分页·${_pdfTurnModeNames[_turnMode]}'
+        : '  滚动';
     return Positioned(
       bottom: 16,
       left: 0,
@@ -618,6 +997,34 @@ class _PdfReaderPageState extends State<PdfReaderPage> {
             ),
           ),
           const SizedBox(height: 8),
+          // 翻页效果切换（仅分页模式显示）
+          if (_viewMode == PdfViewMode.page)
+            PopupMenuButton<PdfPageTurnMode>(
+              icon: _floatIcon(Icons.auto_stories),
+              tooltip: '翻页效果',
+              onSelected: _changeTurnMode,
+              color: Colors.black87,
+              itemBuilder: (ctx) => PdfPageTurnMode.values.map((m) {
+                return PopupMenuItem<PdfPageTurnMode>(
+                  value: m,
+                  child: Row(
+                    children: [
+                      Icon(
+                        _turnMode == m
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                        size: 18,
+                        color: Colors.white,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(_pdfTurnModeNames[m]!,
+                          style: const TextStyle(color: Colors.white)),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          if (_viewMode == PdfViewMode.page) const SizedBox(height: 8),
           // 方向切换
           PopupMenuButton<PdfOrientationMode>(
             icon: _floatIcon(Icons.screen_rotation),

@@ -22,6 +22,7 @@ class PluginManager extends ChangeNotifier {
   static final PluginManager instance = PluginManager._();
 
   static const _kEnabledKey = 'yuedu_enabled_plugins';
+  static const _kDisabledExplicitKey = 'yuedu_disabled_explicit';
   static const _kLocalConfigKey = 'yuedu_local_plugin_configs';
   static const _kRemoteConfigKey = 'yuedu_remote_plugin_configs';
 
@@ -65,10 +66,16 @@ class PluginManager extends ChangeNotifier {
       // 只恢复仍存在的插件 id
       _enabled.addAll(saved.where((id) =>
           _all.any((p) => p.id == id)));
-      // 首次安装：启用 defaultEnabled 的插件
-      if (saved.isEmpty) {
-        for (final p in _all) {
-          if (p.defaultEnabled) _enabled.add(p.id);
+      // 升级迁移：对 defaultEnabled=true 的插件，若用户未显式禁用过则补启用
+      // （老用户升级到引入新插件的版本时，saved 非空但不含新插件 id，需补启用）
+      final explicitlyDisabled = <String>{};
+      try {
+        final disabledRaw = prefs.getStringList(_kDisabledExplicitKey) ?? <String>[];
+        explicitlyDisabled.addAll(disabledRaw.where((id) => _all.any((p) => p.id == id)));
+      } catch (_) {}
+      for (final p in _all) {
+        if (p.defaultEnabled && !_enabled.contains(p.id) && !explicitlyDisabled.contains(p.id)) {
+          _enabled.add(p.id);
         }
       }
       _localConfigs.addAll(prefs.getStringList(_kLocalConfigKey) ?? <String>[]);
@@ -99,6 +106,15 @@ class PluginManager extends ChangeNotifier {
     try {
       await p.onLoad();
       _enabled.add(id);
+      // 清除显式禁用标记
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final list = prefs.getStringList(_kDisabledExplicitKey) ?? <String>[];
+        if (list.contains(id)) {
+          list.remove(id);
+          await prefs.setStringList(_kDisabledExplicitKey, list);
+        }
+      } catch (_) {}
       await _persist();
       notifyListeners();
       return true;
@@ -115,6 +131,17 @@ class PluginManager extends ChangeNotifier {
     try {
       await p.onUnload();
       _enabled.remove(id);
+      // 记录显式禁用，供升级迁移逻辑参考（避免升级时自动补启用）
+      if (p.defaultEnabled) {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          final list = prefs.getStringList(_kDisabledExplicitKey) ?? <String>[];
+          if (!list.contains(id)) {
+            list.add(id);
+            await prefs.setStringList(_kDisabledExplicitKey, list);
+          }
+        } catch (_) {}
+      }
       await _persist();
       notifyListeners();
       return true;

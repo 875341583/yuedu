@@ -2,11 +2,12 @@
 ///
 /// PPTX 文件按幻灯片原始顺序逐页展示，每页提取所有 <a:t> 文本。
 /// 不再强制横屏：默认跟随系统方向，顶部栏可切换 自动/横屏/竖屏。
-/// 嵌入 5 种翻页模式（与 ReaderPage 一致：滑动/覆盖/淡入/翻转/无动画），
-/// 滑动模式用 PageView 跟手，其余模式用 AnimatedSwitcher + 手势触发。
-/// 与排版阅读页、PDF 阅读页并列：PPTX 书走本页。
+/// 嵌入 5 种翻页模式（与 ReaderPage 一致：滑动/覆盖/淡入/翻转/无动画）。
+/// slide 模式用 PageView 跟手，cover/fade/flip 模式用自实现跟手 Stack+Transform，
+/// 点击与滑动翻页均带动画。与排版阅读页、PDF 阅读页并列：PPTX 书走本页。
 library;
 
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -85,10 +86,16 @@ class _PptxReaderPageState extends State<PptxReaderPage>
   /// 拖拽滑块的临时进度
   double? _seekProgress;
 
-  /// 非滑动模式下的 AnimatedSwitcher key（变化时触发动画）
-  int _switchKey = 0;
+  // ─── 跟手翻页状态（非 slide 模式）─────────────────────────
+  /// 当前拖拽的水平偏移（px）。正值=向右拖（看上一页），负值=向左拖（看下一页）。
+  double _dragExtent = 0;
+  bool _isDragging = false;
+  double _animFromExtent = 0;
+  double _animTargetExtent = 0;
+  double _pageFullWidth = 0;
+  int _dragDir = 0; // -1=上一页, 1=下一页, 0=无
 
-  /// 翻页动画控制器（非 slide 模式）
+  /// 翻页动画控制器（非 slide 模式的跟手收尾动画）
   late final AnimationController _animController;
 
   @override
@@ -99,8 +106,10 @@ class _PptxReaderPageState extends State<PptxReaderPage>
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _animController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 350),
+      duration: const Duration(milliseconds: 220),
     );
+    _animController.addListener(_onTurnAnimTick);
+    _animController.addStatusListener(_onTurnAnimStatus);
     _initAsync();
   }
 
@@ -125,7 +134,6 @@ class _PptxReaderPageState extends State<PptxReaderPage>
         _slides = slides;
         _controller = PageController(initialPage: target0);
         _currentPage = target0 + 1;
-        _switchKey = target0;
         _loading = false;
       });
     } catch (e) {
@@ -238,10 +246,11 @@ class _PptxReaderPageState extends State<PptxReaderPage>
         curve: Curves.easeOut,
       );
     } else {
-      _playTurnAnim();
+      // 非 slide 模式：直接切（滑块跳页不走动画）
       setState(() {
         _currentPage = page;
-        _switchKey = page - 1;
+        _dragExtent = 0;
+        _dragDir = 0;
       });
       _persistPage();
     }
@@ -249,15 +258,50 @@ class _PptxReaderPageState extends State<PptxReaderPage>
 
   void _nextPage() {
     final total = _slides?.pageCount ?? 0;
-    if (_currentPage < total) _goToPage(_currentPage + 1);
+    if (_currentPage < total) {
+      if (_turnMode == PptxPageTurnMode.slide) {
+        _goToPage(_currentPage + 1);
+      } else {
+        _animateTurnToPage(1);
+      }
+    }
   }
 
   void _prevPage() {
-    if (_currentPage > 1) _goToPage(_currentPage - 1);
+    if (_currentPage > 1) {
+      if (_turnMode == PptxPageTurnMode.slide) {
+        _goToPage(_currentPage - 1);
+      } else {
+        _animateTurnToPage(-1);
+      }
+    }
   }
 
-  void _playTurnAnim() {
-    _animController.forward(from: 0.0);
+  /// 点击翻页：从静止状态启动一次完整翻页动画
+  void _animateTurnToPage(int dir) {
+    if (_turnMode == PptxPageTurnMode.none) {
+      setState(() {
+        _currentPage += dir;
+        _dragExtent = 0;
+        _dragDir = 0;
+      });
+      _persistPage();
+      return;
+    }
+    if (_animController.isAnimating) return;
+    if (_isDragging) return;
+    final total = _slides?.pageCount ?? 0;
+    final target = _currentPage + dir;
+    if (target < 1 || target > total) return;
+    _dragDir = dir;
+    final w = _pageFullWidth;
+    setState(() {
+      _dragExtent = 0;
+    });
+    _animFromExtent = 0;
+    _animTargetExtent = dir < 0 ? w : -w;
+    _animController.value = 0;
+    _animController.forward();
   }
 
   /// 切换翻页模式
@@ -266,14 +310,11 @@ class _PptxReaderPageState extends State<PptxReaderPage>
     setState(() {
       _turnMode = mode;
       _showMenu = false;
+      _dragExtent = 0;
+      _dragDir = 0;
     });
     await _saveTurnMode(mode);
-    // 切换到非 slide 模式时，需要用 _switchKey 对齐当前页
-    if (mode != PptxPageTurnMode.slide) {
-      setState(() {
-        _switchKey = _currentPage - 1;
-      });
-    } else {
+    if (mode == PptxPageTurnMode.slide) {
       // 切回 slide：跳到当前页
       Future.delayed(const Duration(milliseconds: 100), () {
         if (!mounted) return;
@@ -352,74 +393,233 @@ class _PptxReaderPageState extends State<PptxReaderPage>
         ),
       );
     }
-    // 非滑动模式：AnimatedSwitcher + 手势左右滑动触发翻页
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onTap: _toggleMenu,
-      onHorizontalDragEnd: (details) {
-        final v = details.primaryVelocity ?? 0;
-        if (v < -300) {
-          _nextPage();
-        } else if (v > 300) {
-          _prevPage();
-        }
+    // 非 slide 模式：跟手 Stack + Transform
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _pageFullWidth = constraints.maxWidth;
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTapUp: _handleTapUp,
+          onHorizontalDragStart: _handleDragStart,
+          onHorizontalDragUpdate: _handleDragUpdate,
+          onHorizontalDragEnd: _handleDragEnd,
+          child: _buildPageTurnView(slides),
+        );
       },
-      child: AnimatedSwitcher(
-        duration: _turnDuration,
-        switchInCurve: Curves.easeOut,
-        switchOutCurve: Curves.easeIn,
-        transitionBuilder: (child, anim) =>
-            _buildTransition(child, anim, _turnMode),
-        child: _buildSlide(
-          slides.pages[_currentPage - 1],
-          key: ValueKey(_switchKey),
-        ),
-      ),
     );
   }
 
-  Duration get _turnDuration {
-    switch (_turnMode) {
-      case PptxPageTurnMode.none:
-        return const Duration(milliseconds: 1);
-      case PptxPageTurnMode.fade:
-        return const Duration(milliseconds: 300);
-      case PptxPageTurnMode.flip:
-        return const Duration(milliseconds: 450);
-      case PptxPageTurnMode.cover:
-        return const Duration(milliseconds: 350);
-      case PptxPageTurnMode.slide:
-        return const Duration(milliseconds: 300);
+  /// 点击翻页或切菜单（屏幕三分法）
+  void _handleTapUp(TapUpDetails details) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final dx = details.localPosition.dx;
+    if (dx < screenWidth / 3) {
+      _prevPage();
+    } else if (dx > screenWidth * 2 / 3) {
+      _nextPage();
+    } else {
+      _toggleMenu();
     }
   }
 
-  Widget _buildTransition(
-      Widget child, Animation<double> anim, PptxPageTurnMode mode) {
-    switch (mode) {
-      case PptxPageTurnMode.fade:
-        return FadeTransition(opacity: anim, child: child);
+  // ─── 跟手翻页渲染 ────────────────────────────────────────
+
+  Widget _buildPageTurnView(dynamic slides) {
+    final currentPage = _buildSlide(slides.pages[_currentPage - 1]);
+
+    if ((_dragExtent == 0 && !_animController.isAnimating) ||
+        _turnMode == PptxPageTurnMode.none) {
+      return currentPage;
+    }
+
+    final w = _pageFullWidth;
+    final p = (_dragExtent / w).clamp(-1.0, 1.0);
+    final absP = p.abs();
+
+    // 相邻页索引：dir=-1(上一页)→当前-2，dir=1(下一页)→当前
+    Widget? neighborWidget;
+    if (_dragDir != 0) {
+      final neighborIndex = _dragDir < 0 ? _currentPage - 2 : _currentPage;
+      if (neighborIndex >= 0 && neighborIndex < slides.pageCount) {
+        neighborWidget = _buildSlide(slides.pages[neighborIndex]);
+      }
+    }
+
+    final neighborBase = p > 0 ? -w : w;
+
+    switch (_turnMode) {
       case PptxPageTurnMode.cover:
-        // 新页从右侧覆盖
-        return SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(1, 0),
-            end: Offset.zero,
-          ).animate(anim),
-          child: child,
+        return Stack(
+          children: [
+            currentPage,
+            if (neighborWidget != null)
+              Transform.translate(
+                offset: Offset(neighborBase + _dragExtent, 0),
+                child: neighborWidget,
+              ),
+          ],
         );
+
+      case PptxPageTurnMode.fade:
+        final isNext = p < 0;
+        final progress = absP.clamp(0.0, 1.0);
+        return Stack(
+          children: [
+            ShaderMask(
+              shaderCallback: (rect) {
+                final beginSide =
+                    isNext ? Alignment.centerLeft : Alignment.centerRight;
+                final endSide =
+                    isNext ? Alignment.centerRight : Alignment.centerLeft;
+                return LinearGradient(
+                  begin: beginSide,
+                  end: endSide,
+                  colors: [
+                    const Color(0xFFFFFFFF),
+                    Color.fromRGBO(255, 255, 255, 1 - progress),
+                  ],
+                ).createShader(rect);
+              },
+              blendMode: BlendMode.modulate,
+              child: currentPage,
+            ),
+            if (neighborWidget != null)
+              ShaderMask(
+                shaderCallback: (rect) {
+                  final beginSide =
+                      isNext ? Alignment.centerLeft : Alignment.centerRight;
+                  final endSide =
+                      isNext ? Alignment.centerRight : Alignment.centerLeft;
+                  return LinearGradient(
+                    begin: beginSide,
+                    end: endSide,
+                    colors: [
+                      const Color(0x00FFFFFF),
+                      Color.fromRGBO(255, 255, 255, progress),
+                    ],
+                  ).createShader(rect);
+                },
+                blendMode: BlendMode.modulate,
+                child: neighborWidget,
+              ),
+          ],
+        );
+
       case PptxPageTurnMode.flip:
-        // 3D Y轴翻转
-        return ScaleTransition(
-          scale: Tween(begin: 0.8, end: 1.0).animate(anim),
-          child: RotationTransition(
-            turns: Tween(begin: 0.5, end: 0.0).animate(anim),
-            alignment: Alignment.center,
-            child: child,
-          ),
+        final angle = absP * (math.pi / 2);
+        final align = p > 0 ? Alignment.centerLeft : Alignment.centerRight;
+        return Stack(
+          children: [
+            if (neighborWidget != null)
+              Opacity(opacity: absP.clamp(0.0, 1.0), child: neighborWidget),
+            Transform(
+              alignment: align,
+              transform: Matrix4.identity()
+                ..setEntry(3, 2, 0.002)
+                ..rotateY(angle * (p > 0 ? -1 : 1)),
+              child: Opacity(
+                  opacity: (1 - absP * 0.6).clamp(0.0, 1.0),
+                  child: currentPage),
+            ),
+          ],
         );
+
       case PptxPageTurnMode.slide:
       case PptxPageTurnMode.none:
-        return child;
+        return currentPage;
+    }
+  }
+
+  // ─── 跟手翻页：手势处理 ───────────────────────────────────
+
+  void _handleDragStart(DragStartDetails details) {
+    _isDragging = true;
+    if (_animController.isAnimating) {
+      _animController.stop();
+    }
+    _dragDir = 0;
+  }
+
+  void _handleDragUpdate(DragUpdateDetails details) {
+    if (!_isDragging) return;
+    final delta = details.primaryDelta ?? 0;
+    var next = _dragExtent + delta;
+    final w = _pageFullWidth;
+    if (_dragDir == 0 && next.abs() > 6) {
+      _dragDir = next > 0 ? -1 : 1;
+    }
+    if (_dragDir == -1) {
+      next = next.clamp(0.0, w);
+    } else if (_dragDir == 1) {
+      next = next.clamp(-w, 0.0);
+    } else {
+      next = next.clamp(-w, w);
+    }
+    setState(() {
+      _dragExtent = next;
+    });
+  }
+
+  void _handleDragEnd(DragEndDetails details) {
+    if (!_isDragging) return;
+    _isDragging = false;
+    final velocity = details.primaryVelocity ?? 0;
+    final w = _pageFullWidth;
+    final total = _slides?.pageCount ?? 0;
+
+    // 边界检查
+    final neighborIndex = _dragDir < 0 ? _currentPage - 2 : _currentPage;
+    final hasNeighbor =
+        _dragDir != 0 && neighborIndex >= 0 && neighborIndex < total;
+    if (!hasNeighbor || _dragDir == 0) {
+      _startTurnAnim(0);
+      return;
+    }
+
+    bool shouldTurn;
+    if (_dragDir == -1) {
+      shouldTurn = _dragExtent > w * 0.33 || velocity > 320;
+    } else {
+      shouldTurn = _dragExtent.abs() > w * 0.33 || velocity < -320;
+    }
+    final target = shouldTurn ? (_dragDir == -1 ? w : -w) : 0.0;
+    _startTurnAnim(target);
+  }
+
+  void _startTurnAnim(double target) {
+    _animFromExtent = _dragExtent;
+    _animTargetExtent = target;
+    _animController.value = 0;
+    _animController.forward();
+  }
+
+  void _onTurnAnimTick() {
+    final t = _animController.value;
+    setState(() {
+      _dragExtent =
+          _animFromExtent + (_animTargetExtent - _animFromExtent) * t;
+    });
+  }
+
+  void _onTurnAnimStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed) return;
+    _animController.value = 0;
+    if (_animTargetExtent.abs() > _pageFullWidth * 0.5) {
+      // 完成翻页
+      final dir = _animTargetExtent > 0 ? -1 : 1;
+      final newPage = _currentPage + dir;
+      final total = _slides?.pageCount ?? 0;
+      setState(() {
+        _currentPage = (newPage.clamp(1, total)).toInt();
+        _dragExtent = 0;
+        _dragDir = 0;
+      });
+      _persistPage();
+    } else {
+      setState(() {
+        _dragExtent = 0;
+        _dragDir = 0;
+      });
     }
   }
 
