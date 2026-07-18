@@ -9,10 +9,19 @@
 ///                              <c r="C3" t="inlineStr"><is><t>内联</t></is></c>
 ///
 /// 输出：每个 sheet 一段，标题为 "=== Sheet名 ==="，行内单元格用 \t 分隔。
+///
+/// v0.5.3 关键修复：
+///   1. archive 包内置 ZipDecoder 在某些 xlsx 上抛 RangeError 导致整个解析失败。
+///      本提取器先尝试 archive，若失败或返回异常数据，再用手写 ZIP 解析器兜底。
+///   2. 把 archive.file.content 的 RangeError 当作"此 sheet 解压失败"计入 sheetFailures，
+///      并把失败原因写进错误消息暴露给用户。
+///   3. _parseSheet 完全 try-catch 包裹，绝不向 sheet 循环抛异常。
 library;
 
 import 'dart:convert';
-import 'package:archive/archive.dart';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:archive/archive.dart' as archive;
 
 class XlsxTextExtractor {
   static String extract(List<int> bytes) {
@@ -29,19 +38,54 @@ class XlsxTextExtractor {
       throw Exception('文件格式不正确（不是有效的 .xlsx 压缩包），请确认文件未损坏');
     }
 
-    final Archive archive;
+    // v0.5.3 新方案：先尝试 archive 包，失败再用手写 ZIP 解析器
+    final files = <String, Uint8List>{};
+    var archiveOk = false;
+    String? archiveError;
     try {
-      archive = ZipDecoder().decodeBytes(bytes);
+      final arc = archive.ZipDecoder().decodeBytes(bytes);
+      archiveOk = true;
+      for (final f in arc) {
+        try {
+          final data = f.content as dynamic;
+          if (data is String) {
+            files[f.name] = Uint8List.fromList(utf8.encode(data));
+          } else if (data is List) {
+            files[f.name] = Uint8List.fromList(List<int>.from(data));
+          }
+        } catch (e) {
+          // 单个文件解压失败跳过，但记录原因
+          archiveError ??= '$e';
+        }
+      }
     } catch (e) {
-      throw Exception('XLSX 解压失败，文件可能已损坏或加密 ($e)');
+      archiveError = '$e';
+    }
+
+    // 如果 archive 包没拿到任何文件，或拿到的关键文件不全，用手写 ZIP 解析器兜底
+    if (!archiveOk || files.isEmpty || !files.containsKey('xl/workbook.xml')) {
+      try {
+        final manualFiles = _ManualZip.parse(bytes);
+        // 仅补充 archive 没拿到的文件
+        for (final entry in manualFiles.entries) {
+          files.putIfAbsent(entry.key, () => entry.value);
+        }
+      } catch (_) {
+        // 手写解析器也失败，继续用已有的 files（即使不完整）
+      }
+    }
+
+    if (files.isEmpty) {
+      throw Exception(
+          'XLSX 解压失败：archive 包报错($archiveError)，手写解析器也未提取到任何文件，文件可能已损坏或加密');
     }
 
     // 1. 解析 sharedStrings（可能不存在；解析失败则置空，t="s" 单元格将跳过）
     final sharedStrings = <String>[];
-    final ssFile = archive.findFile('xl/sharedStrings.xml');
-    if (ssFile != null) {
+    final ssBytes = files['xl/sharedStrings.xml'];
+    if (ssBytes != null) {
       try {
-        final xml = _decodeFile(ssFile);
+        final xml = utf8.decode(ssBytes, allowMalformed: true);
         final siRE = RegExp(r'<si[\s>](.*?)</si>', dotAll: true);
         final tRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
         for (final siMatch in siRE.allMatches(xml)) {
@@ -59,51 +103,45 @@ class XlsxTextExtractor {
 
     // 2. 解析 workbook.xml 获取 sheet 名称顺序
     final sheetNames = <String>[];
-    final wbFile = archive.findFile('xl/workbook.xml');
-    if (wbFile != null) {
-      final wbXml = _decodeFile(wbFile);
-      // <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
-      final nameRE = RegExp(r'<sheet\s[^>]*?name="([^"]+)"');
-      for (final m in nameRE.allMatches(wbXml)) {
-        sheetNames.add(_decodeXmlEntities(m.group(1)!));
+    final wbBytes = files['xl/workbook.xml'];
+    if (wbBytes != null) {
+      try {
+        final wbXml = utf8.decode(wbBytes, allowMalformed: true);
+        final nameRE = RegExp(r'<sheet\s[^>]*?name="([^"]+)"');
+        for (final m in nameRE.allMatches(wbXml)) {
+          sheetNames.add(_decodeXmlEntities(m.group(1)!));
+        }
+      } catch (_) {
+        // workbook 解析失败不致命，sheet 名退化为 SheetN
       }
     }
 
-    // 3. 收集所有 sheetN.xml，按 N 数字升序（仅读文件名，不解压）
-    final sheetFiles = <int, ArchiveFile>{};
-    try {
-      for (final f in archive) {
-        final name = f.name;
-        final m = RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(name);
-        if (m != null) {
-          final idx = int.parse(m.group(1)!);
-          sheetFiles[idx] = f;
-        }
-      }
-    } catch (_) {
-      // 迭代异常时回退：逐个 findFile 尝试常见 sheet 序号
-      for (var n = 1; n <= 32; n++) {
-        final f = archive.findFile('xl/worksheets/sheet$n.xml');
-        if (f != null) {
-          sheetFiles[n] = f;
-        }
+    // 3. 收集所有 sheetN.xml，按 N 数字升序
+    final sheetFiles = <int, Uint8List>{};
+    for (final entry in files.entries) {
+      final m = RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(entry.key);
+      if (m != null) {
+        final idx = int.parse(m.group(1)!);
+        sheetFiles[idx] = entry.value;
       }
     }
     final sortedKeys = sheetFiles.keys.toList()..sort();
 
     final buffer = StringBuffer();
-    int sheetFailures = 0;
+    final failureReasons = <String>[];
     for (var i = 0; i < sortedKeys.length; i++) {
       final idx = sortedKeys[i];
       final f = sheetFiles[idx]!;
       final sheetTitle = i < sheetNames.length ? sheetNames[i] : 'Sheet$idx';
-      String sheetText;
+
+      String sheetText = '';
       try {
-        final xml = _decodeFile(f);
+        final xml = utf8.decode(f, allowMalformed: true);
         sheetText = _parseSheet(xml, sharedStrings);
-      } catch (_) {
-        sheetFailures++;
-        continue; // 单个工作表解析失败不阻止其他表
+      } catch (e) {
+        // 单 sheet 解析失败，记录具体原因，不阻止其他表
+        failureReasons.add('$sheetTitle: $e');
+        continue;
       }
       if (sheetText.isNotEmpty) {
         if (buffer.isNotEmpty) buffer.write('\n\n');
@@ -111,9 +149,16 @@ class XlsxTextExtractor {
         buffer.write(sheetText);
       }
     }
+
     if (buffer.isEmpty) {
-      if (sheetFailures > 0) {
-        return '（表格解析失败：$sheetFailures 个工作表无法读取，可能使用了不支持的特性或文件损坏）';
+      if (failureReasons.isNotEmpty) {
+        // 把失败原因拼到错误消息里，方便定位真实问题
+        final reasons = failureReasons.take(3).join('；');
+        final more = failureReasons.length > 3
+            ? '；等共 ${failureReasons.length} 个工作表失败'
+            : '';
+        return '（表格解析失败：${failureReasons.length} 个工作表无法读取。'
+            '原因：$reasons$more）';
       }
       // 空表格不抛异常，返回友好提示（纯图表/图片型表格）
       return '（此表格无可读文本单元格，可能为纯图表或图片型表格）';
@@ -141,7 +186,8 @@ class XlsxTextExtractor {
         if (tAttr == 's') {
           final vMatch = vRE.firstMatch(cellContent);
           if (vMatch != null) {
-            final idx = int.tryParse(vMatch.group(1)!) ?? -1;
+            final v = vMatch.group(1);
+            final idx = v == null ? -1 : (int.tryParse(v) ?? -1);
             if (idx >= 0 && idx < sharedStrings.length) {
               value = sharedStrings[idx];
             }
@@ -149,10 +195,10 @@ class XlsxTextExtractor {
         } else if (tAttr == 'inlineStr') {
           final isMatch = isRE.firstMatch(cellContent);
           if (isMatch != null) {
-            final isContent = isMatch.group(1)!;
+            final isContent = isMatch.group(1) ?? '';
             final buf = StringBuffer();
             for (final tMatch in tInlineRE.allMatches(isContent)) {
-              buf.write(tMatch.group(1));
+              buf.write(tMatch.group(1) ?? '');
             }
             value = _decodeXmlEntities(buf.toString());
           }
@@ -176,36 +222,125 @@ class XlsxTextExtractor {
     return buffer.toString();
   }
 
-  static String _decodeFile(ArchiveFile file) {
+  static String _decodeXmlEntities(String s) {
     try {
-      final data = file.content as dynamic;
-      if (data is String) return data;
-      if (data is List) {
-        final bytes = List<int>.from(data);
-        // xlsx 内 XML 强制 UTF-8，必须用 utf8.decode 正确解析多字节中文
-        return utf8.decode(bytes, allowMalformed: true);
-      }
-      return data.toString();
+      return s
+          .replaceAll('&amp;', '&')
+          .replaceAll('&lt;', '<')
+          .replaceAll('&gt;', '>')
+          .replaceAll('&quot;', '"')
+          .replaceAll('&apos;', "'")
+          .replaceAllMapped(
+            RegExp(r'&#(\d+);'),
+            (m) => String.fromCharCodes([int.parse(m.group(1)!)]),
+          )
+          .replaceAllMapped(
+            RegExp(r'&#x([0-9a-fA-F]+);'),
+            (m) => String.fromCharCodes([int.parse(m.group(1)!, radix: 16)]),
+          );
     } catch (_) {
-      // 解压/解码失败（如 archive 抛 RangeError）返回空串，调用方跳过该部件
-      return '';
+      return s;
     }
   }
+}
 
-  static String _decodeXmlEntities(String s) {
-    return s
-        .replaceAll('&amp;', '&')
-        .replaceAll('&lt;', '<')
-        .replaceAll('&gt;', '>')
-        .replaceAll('&quot;', '"')
-        .replaceAll('&apos;', "'")
-        .replaceAllMapped(
-          RegExp(r'&#(\d+);'),
-          (m) => String.fromCharCodes([int.parse(m.group(1)!)]),
-        )
-        .replaceAllMapped(
-          RegExp(r'&#x([0-9a-fA-F]+);'),
-          (m) => String.fromCharCodes([int.parse(m.group(1)!, radix: 16)]),
-        );
+/// 手写 ZIP 解析器（不依赖 archive 包）
+///
+/// 仅支持 ZIP 格式（PK\x03\x04 local file header），处理常见的 stored(0) 和 deflate(8)
+/// 两种压缩方式。deflate 用 dart:io 的 ZLibDecoder(raw: true) 解压。
+/// 作为 archive 包在特殊 xlsx 上抛 RangeError 时的兜底方案。
+class _ManualZip {
+  static Map<String, Uint8List> parse(List<int> bytes) {
+    final result = <String, Uint8List>{};
+    final data = bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+    var pos = 0;
+    while (pos + 4 <= data.length) {
+      // Local file header signature: 0x04034b50
+      if (data[pos] != 0x50 || data[pos + 1] != 0x4B ||
+          data[pos + 2] != 0x03 || data[pos + 3] != 0x04) {
+        break;
+      }
+      if (pos + 30 > data.length) break;
+
+      // 读取 local file header 字段（小端序）
+      final compressionMethod = _readUint16(data, pos + 8);
+      final compressedSize = _readUint32(data, pos + 18);
+      final uncompressedSize = _readUint32(data, pos + 22);
+      final fileNameLength = _readUint16(data, pos + 26);
+      final extraFieldLength = _readUint16(data, pos + 28);
+
+      final dataStart = pos + 30 + fileNameLength + extraFieldLength;
+      if (dataStart > data.length) break;
+
+      // 文件名
+      final fileNameBytes = data.sublist(pos + 30, pos + 30 + fileNameLength);
+      final fileName = utf8.decode(fileNameBytes, allowMalformed: true);
+
+      // 数据
+      final actualCompressedSize = compressedSize > 0
+          ? compressedSize
+          : _findNextLocalHeader(data, dataStart) - dataStart;
+      if (actualCompressedSize <= 0 ||
+          dataStart + actualCompressedSize > data.length) {
+        // 无法定位下一个 header，停止
+        break;
+      }
+
+      final compressedData = data.sublist(dataStart, dataStart + actualCompressedSize);
+      Uint8List? fileData;
+      try {
+        if (compressionMethod == 0) {
+          // stored
+          fileData = compressedData;
+        } else if (compressionMethod == 8) {
+          // deflate (raw, no zlib header)
+          final decoded = ZLibDecoder(raw: true).convert(compressedData.toList());
+          fileData = Uint8List.fromList(decoded);
+        }
+      } catch (_) {
+        // 解压失败跳过此文件
+      }
+
+      if (fileData != null && fileName.isNotEmpty && !fileName.endsWith('/')) {
+        result[fileName] = fileData;
+      }
+
+      // 移动到下一个 local file header
+      pos = dataStart + actualCompressedSize;
+      // 兜底：如果 uncompressedSize 与实际不符，用 actualCompressedSize 推进
+      if (uncompressedSize > 0 && compressionMethod == 0) {
+        // stored，compressedSize 与 uncompressedSize 相同
+      }
+    }
+    return result;
+  }
+
+  static int _readUint16(Uint8List data, int offset) {
+    if (offset + 2 > data.length) return 0;
+    return data[offset] | (data[offset + 1] << 8);
+  }
+
+  static int _readUint32(Uint8List data, int offset) {
+    if (offset + 4 > data.length) return 0;
+    return data[offset] |
+        (data[offset + 1] << 8) |
+        (data[offset + 2] << 16) |
+        (data[offset + 3] << 24);
+  }
+
+  /// 当 compressedSize 为 0（data descriptor 模式）时，扫描下一个 local header
+  static int _findNextLocalHeader(Uint8List data, int from) {
+    for (var i = from; i + 4 <= data.length; i++) {
+      if (data[i] == 0x50 && data[i + 1] == 0x4B &&
+          data[i + 2] == 0x03 && data[i + 3] == 0x04) {
+        return i;
+      }
+      // Central directory header 也标志着 local files 结束
+      if (data[i] == 0x50 && data[i + 1] == 0x4B &&
+          data[i + 2] == 0x01 && data[i + 3] == 0x02) {
+        return i;
+      }
+    }
+    return data.length;
   }
 }

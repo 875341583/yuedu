@@ -631,23 +631,31 @@ class _PptxReaderPageState extends State<PptxReaderPage>
 
   void _onTurnAnimStatus(AnimationStatus status) {
     if (status != AnimationStatus.completed) return;
-    _animController.value = 0;
-    if (_animTargetExtent.abs() > _pageFullWidth * 0.5) {
-      // 完成翻页
-      final dir = _animTargetExtent > 0 ? -1 : 1;
-      final newPage = _currentPage + dir;
-      final total = _slides?.pageCount ?? 0;
-      setState(() {
-        _currentPage = (newPage.clamp(1, total)).toInt();
-        _dragExtent = 0;
-        _dragDir = 0;
-      });
-      _persistPage();
-    } else {
-      setState(() {
-        _dragExtent = 0;
-        _dragDir = 0;
-      });
+    // ★ 关键修复：value=0 同步触发 _onTurnAnimTick，会把 _dragExtent 蹦回 _animFromExtent
+    // 产生"动画反向跳回起点再被 setState 修正"的单帧闪屏。
+    // 先移除 listener，再做状态变更和 value=0，最后恢复 listener。
+    _animController.removeListener(_onTurnAnimTick);
+    try {
+      if (_animTargetExtent.abs() > _pageFullWidth * 0.5) {
+        // 完成翻页
+        final dir = _animTargetExtent > 0 ? -1 : 1;
+        final newPage = _currentPage + dir;
+        final total = _slides?.pageCount ?? 0;
+        setState(() {
+          _currentPage = (newPage.clamp(1, total)).toInt();
+          _dragExtent = 0;
+          _dragDir = 0;
+        });
+        _persistPage();
+      } else {
+        setState(() {
+          _dragExtent = 0;
+          _dragDir = 0;
+        });
+      }
+      _animController.value = 0;
+    } finally {
+      _animController.addListener(_onTurnAnimTick);
     }
   }
 
