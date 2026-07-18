@@ -113,8 +113,9 @@ class _TypesetPainter extends CustomPainter {
           i++;
           continue;
         }
-        // 行基线 y（glyph.y 是基线，矩形顶部约 y - fontSize * 0.85）
-        final top = g.y - config.fontSize * 0.85;
+        // glyph.y 是行盒顶部（排版引擎 y 从 0 按 lineHeight 递增），
+        // 文字以 Offset(x, glyph.y) 绘制，行盒=[g.y, g.y+lineH]，故高亮覆盖整行行盒
+        final top = g.y;
         double left = g.x;
         double right = g.x + g.width;
         int j = i + 1;
@@ -125,7 +126,7 @@ class _TypesetPainter extends CustomPainter {
             j++;
             continue;
           }
-          final top2 = g2.y - config.fontSize * 0.85;
+          final top2 = g2.y;
           if ((top2 - top).abs() > 0.5) break; // 不同行
           right = g2.x + g2.width;
           j++;

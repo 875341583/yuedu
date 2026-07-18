@@ -36,20 +36,24 @@ class XlsxTextExtractor {
       throw Exception('XLSX 解压失败，文件可能已损坏或加密 ($e)');
     }
 
-    // 1. 解析 sharedStrings
+    // 1. 解析 sharedStrings（可能不存在；解析失败则置空，t="s" 单元格将跳过）
     final sharedStrings = <String>[];
     final ssFile = archive.findFile('xl/sharedStrings.xml');
     if (ssFile != null) {
-      final xml = _decodeFile(ssFile);
-      final siRE = RegExp(r'<si[\s>](.*?)</si>', dotAll: true);
-      final tRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
-      for (final siMatch in siRE.allMatches(xml)) {
-        final siContent = siMatch.group(1) ?? '';
-        final buf = StringBuffer();
-        for (final tMatch in tRE.allMatches(siContent)) {
-          buf.write(tMatch.group(1));
+      try {
+        final xml = _decodeFile(ssFile);
+        final siRE = RegExp(r'<si[\s>](.*?)</si>', dotAll: true);
+        final tRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
+        for (final siMatch in siRE.allMatches(xml)) {
+          final siContent = siMatch.group(1) ?? '';
+          final buf = StringBuffer();
+          for (final tMatch in tRE.allMatches(siContent)) {
+            buf.write(tMatch.group(1));
+          }
+          sharedStrings.add(_decodeXmlEntities(buf.toString()));
         }
-        sharedStrings.add(_decodeXmlEntities(buf.toString()));
+      } catch (_) {
+        // sharedStrings 损坏不致命，继续解析表格
       }
     }
 
@@ -65,25 +69,42 @@ class XlsxTextExtractor {
       }
     }
 
-    // 3. 收集所有 sheetN.xml，按 N 数字升序
+    // 3. 收集所有 sheetN.xml，按 N 数字升序（仅读文件名，不解压）
     final sheetFiles = <int, ArchiveFile>{};
-    for (final f in archive) {
-      final name = f.name;
-      final m = RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(name);
-      if (m != null) {
-        final idx = int.parse(m.group(1)!);
-        sheetFiles[idx] = f;
+    try {
+      for (final f in archive) {
+        final name = f.name;
+        final m = RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(name);
+        if (m != null) {
+          final idx = int.parse(m.group(1)!);
+          sheetFiles[idx] = f;
+        }
+      }
+    } catch (_) {
+      // 迭代异常时回退：逐个 findFile 尝试常见 sheet 序号
+      for (var n = 1; n <= 32; n++) {
+        final f = archive.findFile('xl/worksheets/sheet$n.xml');
+        if (f != null) {
+          sheetFiles[n] = f;
+        }
       }
     }
     final sortedKeys = sheetFiles.keys.toList()..sort();
 
     final buffer = StringBuffer();
+    int sheetFailures = 0;
     for (var i = 0; i < sortedKeys.length; i++) {
       final idx = sortedKeys[i];
       final f = sheetFiles[idx]!;
       final sheetTitle = i < sheetNames.length ? sheetNames[i] : 'Sheet$idx';
-      final xml = _decodeFile(f);
-      final sheetText = _parseSheet(xml, sharedStrings);
+      String sheetText;
+      try {
+        final xml = _decodeFile(f);
+        sheetText = _parseSheet(xml, sharedStrings);
+      } catch (_) {
+        sheetFailures++;
+        continue; // 单个工作表解析失败不阻止其他表
+      }
       if (sheetText.isNotEmpty) {
         if (buffer.isNotEmpty) buffer.write('\n\n');
         buffer.write('=== $sheetTitle ===\n');
@@ -91,6 +112,9 @@ class XlsxTextExtractor {
       }
     }
     if (buffer.isEmpty) {
+      if (sheetFailures > 0) {
+        return '（表格解析失败：$sheetFailures 个工作表无法读取，可能使用了不支持的特性或文件损坏）';
+      }
       // 空表格不抛异常，返回友好提示（纯图表/图片型表格）
       return '（此表格无可读文本单元格，可能为纯图表或图片型表格）';
     }
@@ -153,14 +177,19 @@ class XlsxTextExtractor {
   }
 
   static String _decodeFile(ArchiveFile file) {
-    final data = file.content as dynamic;
-    if (data is String) return data;
-    if (data is List) {
-      final bytes = List<int>.from(data);
-      // xlsx 内 XML 强制 UTF-8，必须用 utf8.decode 正确解析多字节中文
-      return utf8.decode(bytes, allowMalformed: true);
+    try {
+      final data = file.content as dynamic;
+      if (data is String) return data;
+      if (data is List) {
+        final bytes = List<int>.from(data);
+        // xlsx 内 XML 强制 UTF-8，必须用 utf8.decode 正确解析多字节中文
+        return utf8.decode(bytes, allowMalformed: true);
+      }
+      return data.toString();
+    } catch (_) {
+      // 解压/解码失败（如 archive 抛 RangeError）返回空串，调用方跳过该部件
+      return '';
     }
-    return data.toString();
   }
 
   static String _decodeXmlEntities(String s) {
