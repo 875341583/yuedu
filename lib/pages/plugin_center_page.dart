@@ -232,8 +232,6 @@ class _PluginCenterPageState extends State<PluginCenterPage> {
             const SizedBox(height: 12),
             _futureItem(Icons.translate, '翻译插件',
                 '选中文本翻译为目标语言（接入在线翻译 API 或本地词典）'),
-            _futureItem(Icons.highlight, '高亮加粗插件',
-                '阅读时高亮选中文本，加粗标注重点，跨书籍管理高亮笔记'),
             _futureItem(Icons.search, '搜索释义插件',
                 '选词搜索词典释义，支持本地词典和在线百科'),
             _futureItem(Icons.psychology, '本地 AI 小模型',

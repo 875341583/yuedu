@@ -10,13 +10,16 @@ import 'package:flutter/gestures.dart';
 
 import '../models/book.dart';
 import '../models/bookmark.dart';
+import '../models/highlight.dart';
 import '../services/bookshelf_service.dart';
 import '../services/bookmark_service.dart';
+import '../services/highlight_service.dart';
 import '../typeset/types.dart';
 import '../typeset/typeset_engine_provider.dart';
 import '../utils/chapter_parser.dart';
 import '../widgets/typeset_renderer.dart';
 import '../widgets/toc_bookmark_panel.dart';
+import '../plugins/plugin_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ─── 翻页模式 ───────────────────────────────────────────────
@@ -236,6 +239,18 @@ class _ReaderPageState extends State<ReaderPage>
   /// 书签列表
   List<Bookmark> _bookmarks = [];
 
+  /// 高亮列表（当前书）
+  List<Highlight> _highlights = [];
+
+  // ─── 文本选区（长按拖动选取）状态 ───────────────────────
+  /// 是否在选区模式（长按后置 true，松手或取消后置 false）
+  bool _isSelecting = false;
+  /// 选区起止 glyph 索引（在当前页 result.glyphs 中）
+  int _selStartGlyph = -1;
+  int _selEndGlyph = -1;
+  /// 选区起止屏幕坐标（用于工具栏定位）
+  Offset _selAnchorOffset = Offset.zero;
+
   /// 是否正在解析章节
   bool _isParsingChapters = false;
 
@@ -272,6 +287,7 @@ class _ReaderPageState extends State<ReaderPage>
     _loadSettings();
     _loadContent();
     _loadBookmarks();
+    _loadHighlights();
     _ensureChapters();
   }
 
@@ -281,6 +297,16 @@ class _ReaderPageState extends State<ReaderPage>
     if (mounted) {
       setState(() {
         _bookmarks = BookmarkService.instance.getBookmarksForBook(widget.book.id);
+      });
+    }
+  }
+
+  /// 加载高亮
+  Future<void> _loadHighlights() async {
+    await HighlightService.instance.loadFromStorage();
+    if (mounted) {
+      setState(() {
+        _highlights = HighlightService.instance.getHighlightsForBook(widget.book.id);
       });
     }
   }
@@ -648,6 +674,9 @@ class _ReaderPageState extends State<ReaderPage>
                 onHorizontalDragStart: _handleDragStart,
                 onHorizontalDragUpdate: _handleDragUpdate,
                 onHorizontalDragEnd: _handleDragEnd,
+                onLongPressStart: _handleLongPressStart,
+                onLongPressMoveUpdate: _handleLongPressUpdate,
+                onLongPressEnd: _handleLongPressEnd,
                 child: Container(
                   color: _theme.bg,
                   padding: EdgeInsets.only(
@@ -800,6 +829,8 @@ class _ReaderPageState extends State<ReaderPage>
         config: _config,
         textColor: _theme.text,
         bgColor: _theme.bg,
+        highlights: _computeHighlightSpansForPage(_currentPage!),
+        selection: _currentSelectionSpan,
       ),
     );
   }
@@ -861,6 +892,8 @@ class _ReaderPageState extends State<ReaderPage>
 
   void _handleDragUpdate(DragUpdateDetails details) {
     if (!_isDragging) return;
+    // 选区模式下，水平拖拽不影响翻页（让选区由 longPressMoveUpdate 主动更新）
+    if (_isSelecting) return;
     final delta = details.primaryDelta ?? 0;
     var next = _dragExtent + delta;
     final w = _pageFullWidth;
@@ -934,6 +967,215 @@ class _ReaderPageState extends State<ReaderPage>
       } else if (event.scrollDelta.dy < 0) {
         _prevPage();
       }
+    }
+  }
+
+  // ─── 文本选区：长按手势 ─────────────────────────────────
+
+  void _handleLongPressStart(LongPressStartDetails details) {
+    // 大文件不启用选区（跨窗口偏移复杂），直接返回
+    if (_isLargeFile) return;
+    // 插件未启用时不响应
+    if (!PluginManager.instance.isEnabled('highlight')) return;
+    if (_currentPage == null || _currentPage!.result.glyphs.isEmpty) return;
+
+    // localPosition 在 GestureDetector 的 child 内（Container 有 padding）
+    // 命中测试需用相对 CustomPaint 的坐标：减去水平 padding（_marginH + safePadding.top）
+    final safeTop = MediaQuery.of(context).padding.top;
+    final local = Offset(
+      details.localPosition.dx - _marginH,
+      details.localPosition.dy - safeTop,
+    );
+
+    final hit = _hitTestGlyph(local);
+    if (hit < 0) return;
+
+    setState(() {
+      _isSelecting = true;
+      _selStartGlyph = hit;
+      _selEndGlyph = hit;
+      _selAnchorOffset = details.globalPosition;
+    });
+    _selectionFeedback();
+  }
+
+  void _handleLongPressUpdate(LongPressMoveUpdateDetails details) {
+    if (!_isSelecting) return;
+    final safeTop = MediaQuery.of(context).padding.top;
+    final local = Offset(
+      details.localPosition.dx - _marginH,
+      details.localPosition.dy - safeTop,
+    );
+    final hit = _hitTestGlyph(local);
+    if (hit < 0) return;
+    if (hit != _selEndGlyph) {
+      setState(() {
+        _selEndGlyph = hit;
+      });
+    }
+  }
+
+  void _handleLongPressEnd(LongPressEndDetails details) {
+    if (!_isSelecting) return;
+    // 短按没拖动 → 视为单字选取（保留 _selStart=_selEnd 的状态，弹出工具栏）
+    // 拖动过 → 弹工具栏
+    _showSelectionToolbar();
+  }
+
+  /// 长按触发瞬间的振动反馈
+  void _selectionFeedback() {
+    try {
+      HapticFeedback.selectionClick();
+    } catch (_) {}
+  }
+
+  /// 弹出选区工具栏：复制 / 5 色高亮 / 加笔记 / 取消
+  void _showSelectionToolbar() {
+    if (!_isSelecting || _currentPage == null) return;
+    final preview = _selectionPreview;
+    if (preview.isEmpty) {
+      _clearSelection();
+      return;
+    }
+
+    // 用 OverlayEntry 在选区附近显示工具栏
+    final overlay = Overlay.of(context);
+    late OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (ctx) => _SelectionToolbar(
+        anchor: _selAnchorOffset,
+        preview: preview,
+        onSelectColor: (colorIdx) async {
+          await _commitHighlight(colorIdx, note: null);
+          entry.remove();
+          _clearSelection();
+        },
+        onAddNote: () async {
+          entry.remove();
+          await _promptForNoteAndCreate();
+        },
+        onCopy: () {
+          Clipboard.setData(ClipboardData(text: preview));
+          entry.remove();
+          _clearSelection();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('已复制'), duration: Duration(milliseconds: 800)),
+            );
+          }
+        },
+        onCancel: () {
+          entry.remove();
+          _clearSelection();
+        },
+      ),
+    );
+    overlay.insert(entry);
+  }
+
+  /// 弹出笔记输入对话框，确认后创建带笔记的高亮
+  Future<void> _promptForNoteAndCreate() async {
+    if (!_isSelecting) return;
+    final preview = _selectionPreview;
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('添加笔记', style: TextStyle(fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: _theme.surface,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              constraints: const BoxConstraints(maxHeight: 100),
+              child: SingleChildScrollView(
+                child: Text(preview, style: TextStyle(fontSize: 12, color: _theme.text)),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              maxLines: 4,
+              autofocus: true,
+              decoration: InputDecoration(
+                hintText: '笔记内容...',
+                border: const OutlineInputBorder(),
+                contentPadding: const EdgeInsets.all(10),
+                hintStyle: TextStyle(color: _theme.hint),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(null),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (result != null && result.isNotEmpty) {
+      await _commitHighlight(0, note: result);
+    }
+    _clearSelection();
+  }
+
+  /// 实际提交高亮到 HighlightService 并刷新本地列表
+  Future<void> _commitHighlight(int colorIndex, {String? note}) async {
+    if (!_isSelecting || _currentPage == null) return;
+    final (startChar, endChar) = _selectionCharRange;
+    if (endChar <= startChar) return;
+    final preview = _selectionPreview;
+
+    String? chapterTitle;
+    try {
+      // 取起点最近的章节标题
+      for (int i = widget.book.chapters.length - 1; i >= 0; i--) {
+        if (widget.book.chapters[i].startOffset <= startChar) {
+          chapterTitle = widget.book.chapters[i].title;
+          break;
+        }
+      }
+    } catch (_) {}
+
+    await HighlightService.instance.addHighlight(
+      bookId: widget.book.id,
+      startOffset: startChar,
+      endOffset: endChar,
+      position: startChar,
+      preview: preview,
+      colorIndex: colorIndex,
+      note: note,
+      chapterTitle: chapterTitle,
+    );
+    if (mounted) {
+      setState(() {
+        _highlights = HighlightService.instance.getHighlightsForBook(widget.book.id);
+      });
+    }
+  }
+
+  /// 清除选区状态
+  void _clearSelection() {
+    if (mounted) {
+      setState(() {
+        _isSelecting = false;
+        _selStartGlyph = -1;
+        _selEndGlyph = -1;
+      });
+    } else {
+      _isSelecting = false;
+      _selStartGlyph = -1;
+      _selEndGlyph = -1;
     }
   }
 
@@ -1079,6 +1321,124 @@ class _ReaderPageState extends State<ReaderPage>
     return '位置 ${_isLargeFile ? _byteOffset : _offset}';
   }
 
+  // ─── 高亮：glyph 索引 ↔ 字符偏移 映射 ───────────────────
+
+  /// 给定当前页某 glyph 索引，返回它在文本窗口中的字符偏移。
+  /// 与 _computePage 中的 charCount 算法一致：跳过 isCjkLatinSpacing
+  int _charOffsetForGlyph(_PageData page, int glyphIndex) {
+    int charCount = 0;
+    for (int i = 0; i < glyphIndex && i < page.result.glyphs.length; i++) {
+      if (!page.result.glyphs[i].isCjkLatinSpacing) {
+        charCount++;
+      }
+    }
+    return page.startOffset + charCount;
+  }
+
+  /// 反向：给定当前页内字符偏移（相对页起点），返回对应 glyph 索引
+  /// （找到第 charIndex 个非 spacing glyph 的索引）
+  int _glyphIndexForCharOffset(_PageData page, int charOffsetInPage) {
+    int count = 0;
+    for (int i = 0; i < page.result.glyphs.length; i++) {
+      final g = page.result.glyphs[i];
+      if (g.isCjkLatinSpacing || g.char == '\n') continue;
+      if (count == charOffsetInPage) return i;
+      count++;
+    }
+    return page.result.glyphs.length - 1;
+  }
+
+  /// 全文绝对字符偏移（小文件）或字节偏移（大文件）—— 用于高亮 position 字段锚点
+  int get _currentPosForBookmark => _isLargeFile ? _byteOffset : _offset;
+
+  /// 计算当前页应渲染的高亮 HighlightSpan 列表
+  /// 思路：对每个本页高亮，把它的 startOffset/endOffset 投影到当前页的 glyph 索引区间
+  List<HighlightSpan> _computeHighlightSpansForPage(_PageData page) {
+    if (_highlights.isEmpty || page.result.glyphs.isEmpty) return [];
+    // 小文件模式：高亮的 startOffset/endOffset 是全文字符偏移；
+    // 当前页 _currentPage.startOffset 是文本窗口偏移（小文件=_offset，等于全文偏移）
+    final pageStartGlobal = page.startOffset + _windowStartChar;
+    final pageEndGlobal = page.endOffset + _windowStartChar;
+    final spans = <HighlightSpan>[];
+    for (final h in _highlights) {
+      // 大文件暂时不显示持久化高亮（跨窗口偏移复杂），仅小文件模式启用
+      if (_isLargeFile) continue;
+      // 区间与当前页相交？
+      if (h.startOffset >= pageEndGlobal || h.endOffset <= pageStartGlobal) continue;
+      // 投影到页内偏移
+      final startInPage = (h.startOffset - pageStartGlobal).clamp(0, pageEndGlobal - pageStartGlobal);
+      final endInPage = (h.endOffset - pageStartGlobal).clamp(0, pageEndGlobal - pageStartGlobal);
+      if (endInPage <= startInPage) continue;
+      final startG = _glyphIndexForCharOffset(page, startInPage);
+      final endG = _glyphIndexForCharOffset(page, endInPage - 1) + 1;
+      if (endG <= startG) continue;
+      spans.add(HighlightSpan(
+        startGlyphIndex: startG,
+        endGlyphIndex: endG,
+        color: Color(HighlightColors.indexToArgb(h.colorIndex)),
+      ));
+    }
+    return spans;
+  }
+
+  /// 临时选区 SelectionSpan（如果有）
+  SelectionSpan? get _currentSelectionSpan {
+    if (!_isSelecting || _selStartGlyph < 0 || _selEndGlyph < 0) return null;
+    final start = _selStartGlyph < _selEndGlyph ? _selStartGlyph : _selEndGlyph;
+    final end = (_selStartGlyph < _selEndGlyph ? _selEndGlyph : _selStartGlyph) + 1;
+    return SelectionSpan(startGlyphIndex: start, endGlyphIndex: end, color: const Color(0xFF607D8B));
+  }
+
+  /// 选取区段对应文本（用于高亮 preview 与复制）
+  String get _selectionPreview {
+    if (!_isSelecting || _currentPage == null) return '';
+    final startIdx = _selStartGlyph < _selEndGlyph ? _selStartGlyph : _selEndGlyph;
+    final endIdx = (_selStartGlyph < _selEndGlyph ? _selEndGlyph : _selStartGlyph) + 1;
+    final sb = StringBuffer();
+    for (int i = startIdx; i < endIdx && i < _currentPage!.result.glyphs.length; i++) {
+      final g = _currentPage!.result.glyphs[i];
+      if (g.isCjkLatinSpacing || g.char == '\n') continue;
+      sb.write(g.char);
+    }
+    return sb.toString();
+  }
+
+  /// 命中测试：根据屏幕坐标（相对 CustomPaint 容器）找出命中的 glyph 索引
+  /// 返回 -1 表示未命中。注意 localPosition 来自 GestureDetector，需要减去 padding
+  int _hitTestGlyph(Offset localPos) {
+    if (_currentPage == null || _currentPage!.result.glyphs.isEmpty) return -1;
+    final glyphs = _currentPage!.result.glyphs;
+    // y 在 [glyph.y - fontSize*0.85, glyph.y + fontSize*0.15) 区间视为本行
+    final fontSize = _config.fontSize;
+    // 先找最近的行
+    int bestIdx = -1;
+    double bestDist = 1e18;
+    for (int i = 0; i < glyphs.length; i++) {
+      final g = glyphs[i];
+      if (g.isCjkLatinSpacing || g.char == '\n') continue;
+      // 取字符中心点
+      final cx = g.x + g.width / 2;
+      final cy = g.y - fontSize * 0.35;
+      final d = (cx - localPos.dx) * (cx - localPos.dx) +
+          (cy - localPos.dy) * (cy - localPos.dy);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  /// 当前选区在文本窗口中的起止字符偏移
+  (int, int) get _selectionCharRange {
+    if (_currentPage == null || !_isSelecting) return (0, 0);
+    final startIdx = _selStartGlyph < _selEndGlyph ? _selStartGlyph : _selEndGlyph;
+    final endIdx = (_selStartGlyph < _selEndGlyph ? _selEndGlyph : _selStartGlyph) + 1;
+    final startChar = _charOffsetForGlyph(_currentPage!, startIdx);
+    final endChar = _charOffsetForGlyph(_currentPage!, endIdx - 1) + 1;
+    return (startChar, endChar);
+  }
+
   /// 添加/移除当前页书签
   Future<void> _toggleBookmark() async {
     final pos = _isLargeFile ? _byteOffset : _offset;
@@ -1107,6 +1467,8 @@ class _ReaderPageState extends State<ReaderPage>
   /// 显示目录与书签面板
   void _showTocBookmarkPanel() {
     final pos = _isLargeFile ? _byteOffset : _offset;
+    // 打开面板前刷新一次高亮列表，确保最新
+    final highlights = HighlightService.instance.getHighlightsForBook(widget.book.id);
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -1115,6 +1477,7 @@ class _ReaderPageState extends State<ReaderPage>
         book: widget.book,
         chapters: widget.book.chapters,
         bookmarks: _bookmarks,
+        highlights: highlights,
         currentPosition: pos,
         isLargeFile: _isLargeFile,
         onJump: _jumpToChapter,
@@ -1126,6 +1489,22 @@ class _ReaderPageState extends State<ReaderPage>
           if (mounted) {
             setState(() {
               _bookmarks = BookmarkService.instance.getBookmarksForBook(widget.book.id);
+            });
+          }
+        },
+        onRemoveHighlight: (id) async {
+          await HighlightService.instance.removeHighlight(id);
+          if (mounted) {
+            setState(() {
+              _highlights = HighlightService.instance.getHighlightsForBook(widget.book.id);
+            });
+          }
+        },
+        onUpdateHighlightNote: (id, note) async {
+          await HighlightService.instance.updateNote(id, note);
+          if (mounted) {
+            setState(() {
+              _highlights = HighlightService.instance.getHighlightsForBook(widget.book.id);
             });
           }
         },
@@ -1705,6 +2084,103 @@ class _ReaderPageState extends State<ReaderPage>
             '${(_progress * 100).toStringAsFixed(1)}%',
             style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.w400),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 选区工具栏（Overlay 浮层）
+// ─────────────────────────────────────────────────────────────
+
+class _SelectionToolbar extends StatelessWidget {
+  final Offset anchor;
+  final String preview;
+  final Future<void> Function(int colorIndex) onSelectColor;
+  final Future<void> Function() onAddNote;
+  final VoidCallback onCopy;
+  final VoidCallback onCancel;
+
+  const _SelectionToolbar({
+    required this.anchor,
+    required this.preview,
+    required this.onSelectColor,
+    required this.onAddNote,
+    required this.onCopy,
+    required this.onCancel,
+  });
+
+  static const _colorArgs = <int>[0xFFFFEB3B, 0xFFA5D6A7, 0xFF90CAF9, 0xFFEF9A9A, 0xFFCE93D8];
+
+  @override
+  Widget build(BuildContext context) {
+    final mq = MediaQuery.of(context);
+    final top = (anchor.dy - 110).clamp(mq.padding.top + 8.0, mq.size.height - 160);
+
+    return Positioned(
+      left: 0,
+      right: 0,
+      top: top,
+      child: Center(
+        child: Material(
+          elevation: 8,
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF2C2C2C),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 5 色高亮
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (int i = 0; i < _colorArgs.length; i++)
+                      GestureDetector(
+                        onTap: () => onSelectColor(HighlightColors.colorToIndex(_colorArgs[i])),
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(horizontal: 3),
+                          width: 30,
+                          height: 30,
+                          decoration: BoxDecoration(
+                            color: Color(_colorArgs[i]).withOpacity(0.55),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white24, width: 1.5),
+                          ),
+                        ),
+                      ),
+                    const SizedBox(width: 8),
+                    Container(width: 1, height: 24, color: Colors.white24),
+                    const SizedBox(width: 8),
+                    _iconBtn(Icons.note_add, '笔记', onAddNote),
+                    _iconBtn(Icons.copy, '复制', onCopy),
+                    _iconBtn(Icons.close, '取消', onCancel),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _iconBtn(IconData icon, String label, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: Colors.white, size: 20),
+            Text(label, style: const TextStyle(color: Colors.white70, fontSize: 10)),
+          ],
         ),
       ),
     );

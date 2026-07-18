@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'plugin.dart';
 import 'builtin/file_category_plugin.dart';
+import 'builtin/highlight_plugin.dart';
 
 /// 启用状态变化通知回调
 typedef PluginStateCallback = void Function(String pluginId, bool enabled);
@@ -55,6 +56,7 @@ class PluginManager extends ChangeNotifier {
 
     // 注册内置插件
     _register(FileCategoryPlugin());
+    _register(HighlightPlugin());
 
     // 读取持久化
     try {
