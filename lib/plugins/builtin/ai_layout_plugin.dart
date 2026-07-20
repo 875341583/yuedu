@@ -233,13 +233,16 @@ class AiLayoutPlugin extends YueDuPlugin {
     );
   }
 
-  /// 测试 API 连通性
-  Future<bool> testConnection() async {
+  /// 测试 API 连通性，返回 (成功?, 错误信息?)
+  Future<(bool, String?)> testConnection() async {
     try {
-      final result = await chat('你好，请回复"连接成功"四个字。', systemPrompt: '请简短回复。');
-      return result.isNotEmpty;
-    } catch (_) {
-      return false;
+      final result = await callApi(
+        systemPrompt: '请简短回复。',
+        userMessage: '回复ok',
+      );
+      return (result.isNotEmpty, null);
+    } catch (e) {
+      return (false, e.toString());
     }
   }
 }
@@ -318,11 +321,12 @@ class _AiLayoutSettingsPanelState extends State<_AiLayoutSettingsPanel> {
       await _plugin.setApiUrl(_urlController.text);
       await _plugin.setApiKey(_keyController.text);
       await _plugin.setModel(_modelController.text);
-      final ok = await _plugin.testConnection();
+      final (ok, error) = await _plugin.testConnection();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(ok ? '连接成功，AI API 可正常使用' : '连接失败，请检查配置'),          duration: const Duration(seconds: 3),
+          content: Text(ok ? '连接成功，AI API 可正常使用' : '连接失败: ${error ?? "未知错误"}'),
+          duration: const Duration(seconds: 4),
           backgroundColor: ok ? Colors.green : Colors.red,
         ),
       );
@@ -330,7 +334,7 @@ class _AiLayoutSettingsPanelState extends State<_AiLayoutSettingsPanel> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('连接失败: $e'),
+          content: Text('连接异常: $e'),
           duration: const Duration(seconds: 4),
           backgroundColor: Colors.red,
         ),
@@ -344,7 +348,7 @@ class _AiLayoutSettingsPanelState extends State<_AiLayoutSettingsPanel> {
   void _fillSiliconFlowDefaults() {
     _urlController.text = 'https://api.siliconflow.cn/v1/chat/completions';
     _keyController.text = 'sk-qoenrtsudajsgmjkkwsqnnqofetrceoetajjsbngikpmahlc';
-    _modelController.text = 'DeepSeek-Qwen3-8B';
+    _modelController.text = 'deepseek-ai/DeepSeek-V3';
     setState(() {});
   }
 
@@ -431,7 +435,7 @@ class _AiLayoutSettingsPanelState extends State<_AiLayoutSettingsPanel> {
             child: OutlinedButton.icon(
               onPressed: _fillSiliconFlowDefaults,
               icon: const Icon(Icons.bolt, size: 20),
-              label: const Text('一键配置 SiliconFlow（DeepSeek-Qwen3-8B）'),
+              label: const Text('一键配置 SiliconFlow（DeepSeek-V3）'),
               style: OutlinedButton.styleFrom(
                 foregroundColor: Colors.indigo,
                 side: const BorderSide(color: Colors.indigo),

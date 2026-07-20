@@ -8,11 +8,10 @@
 ///   Doc_0/Pages/Page_0/PageContent.xml
 ///   每页 Content.xml 含 <TextObject><TextCode>文本</TextCode></TextObject>
 ///
-/// 本提取器解包后扫描所有 .xml 文件，将含 <TextObject|TextCode|TextCode 后续指令>
-/// 的页面按文件名顺序排列，提取所有 TextCode 内可见文本。
-/// OFD 的 TextCode 可能含 X/Y 坐标属性及绘图指令（如 "G\n" 字形），这里采用宽松策略：
-/// - 优先取 <TextCode X=".." Y="..">实际文字</TextCode> 形式
-/// - 输出每页一段文本
+/// 本提取器解包后扫描所有 .xml 文件，按多种策略提取文本：
+/// 1. 优先提取 <TextCode> 标签内容
+/// 2. 补充提取 <TextObject> 内的其他文本
+/// 3. 最终 fallback：提取所有 XML 标签外的纯文本
 library;
 
 import 'dart:convert';
@@ -28,31 +27,35 @@ class OfdTextExtractor {
     }
 
     // 收集所有疑似页面内容 XML
-    // OFD 页面文件名常见：Pages/Page_N/Content.xml 或 Page_N/PageContent.xml
-    // 我们直接遍历所有 .xml 中包含 <TextObject 或 <TextCode 的文件
     final pageEntries = <_OfdPage>[];
     for (final f in archive) {
       final name = f.name;
-      if (!name.toLowerCase().endsWith('.xml')) continue;
-      String xml;
-      try {
-        xml = _decodeFile(f);
-      } catch (_) {
-        continue;
+      if (name.toLowerCase().endsWith('.xml')) {
+        String xml;
+        try {
+          xml = _decodeFile(f);
+        } catch (_) {
+          continue;
+        }
+        // 检查是否含页面内容标记
+        if (xml.contains('TextObject') ||
+            xml.contains('TextCode') ||
+            xml.contains('Page') ||
+            xml.contains('Content')) {
+          final text = _extractPageText(xml);
+          pageEntries.add(_OfdPage(name, text));
+        }
       }
-      if (!xml.contains('TextObject') && !xml.contains('TextCode')) continue;
-      final text = _extractPageText(xml);
-      pageEntries.add(_OfdPage(name, text));
     }
 
     if (pageEntries.isEmpty) {
-      // 退化：直接拼接所有 xml 中的 <TextCode> 内容
+      // 终极 fallback：遍历所有文件提取可读文本
       final fallback = StringBuffer();
       for (final f in archive) {
         if (!f.name.toLowerCase().endsWith('.xml')) continue;
         try {
           final xml = _decodeFile(f);
-          final text = _extractPageText(xml);
+          final text = _extractAllReadableText(xml);
           if (text.isNotEmpty) {
             if (fallback.isNotEmpty) fallback.write('\n\n');
             fallback.write(text);
@@ -60,7 +63,10 @@ class OfdTextExtractor {
         } catch (_) {}
       }
       final s = fallback.toString();
-      if (s.isEmpty) throw Exception('OFD 文件无可读文本');
+      if (s.isEmpty) {
+        throw Exception(
+            'OFD 文件无可读文本。可能原因：1)文件为扫描件(纯图片无文字层)；2)OFD使用了特殊字形编码；3)文件格式异常');
+      }
       return s;
     }
 
@@ -80,31 +86,83 @@ class OfdTextExtractor {
       buffer.write('--- 第 ${i + 1} 页 ---\n');
       buffer.write(text);
     }
-    if (buffer.isEmpty) throw Exception('OFD 文件无可读文本');
+    if (buffer.isEmpty) {
+      throw Exception(
+          'OFD 文件无可读文本。可能原因：1)文件为扫描件(纯图片无文字层)；2)OFD使用了特殊字形编码；3)文件格式异常');
+    }
     return buffer.toString();
   }
 
-  /// 解析单个页面 Content.xml 中的文字
+  /// 解析单个页面 XML 中的文字
+  /// 策略1: <TextCode ...>文字</TextCode>
+  /// 策略2: <TextObject> 内非子标签的文本
+  /// 策略3: 所有 XML 标签外的中文/可读文本
   static String _extractPageText(String xml) {
     final buffer = StringBuffer();
-    // <TextCode ...>文字</TextCode>
-    final tcRE = RegExp(r'<TextCode\b[^>]*>([^<]*)</TextCode>');
+
+    // 策略1: 标准 <TextCode> 标签
+    final tcRE = RegExp(r'<TextCode\b[^>]*>([^<]*)</TextCode>', dotAll: true);
     for (final m in tcRE.allMatches(xml)) {
       final raw = m.group(1) ?? '';
-      // OFD TextCode 内容可能含字形编码（"G..." 指令），这里启发式过滤：
-      // 仅保留正常可见字符（可见 ASCII 与常见中文）
       final cleaned = _cleanOfdText(raw);
       if (cleaned.isNotEmpty) {
         if (buffer.isNotEmpty) buffer.write('\n');
         buffer.write(cleaned);
       }
     }
-    return buffer.toString();
+
+    // 如果策略1已有文本，直接返回（避免重复提取）
+    if (buffer.isNotEmpty) return buffer.toString();
+
+    // 策略2: <TextObject> 内的非标签文本（有些OFD不使用TextCode子标签）
+    final toRE = RegExp(r'<TextObject\b[^>]*>(.*?)</TextObject>', dotAll: true);
+    for (final m in toRE.allMatches(xml)) {
+      final inner = m.group(1) ?? '';
+      // 去掉子标签，只留文本
+      final textOnly = inner.replaceAll(RegExp(r'<[^>]+>'), '').trim();
+      final cleaned = _cleanOfdText(textOnly);
+      if (cleaned.isNotEmpty) {
+        if (buffer.isNotEmpty) buffer.write('\n');
+        buffer.write(cleaned);
+      }
+    }
+
+    if (buffer.isNotEmpty) return buffer.toString();
+
+    // 策略3: 提取XML中所有标签外的可读文本
+    return _extractAllReadableText(xml);
+  }
+
+  /// 提取 XML 中所有标签外的可读文本（终极 fallback）
+  static String _extractAllReadableText(String xml) {
+    // 去掉所有 XML 标签，只留文本内容
+    final textOnly = xml.replaceAll(RegExp(r'<[^>]+>'), ' ');
+    // 按空白分割，过滤掉纯符号/纯数字/空串
+    final parts = textOnly
+        .split(RegExp(r'\s+'))
+        .where((s) => s.isNotEmpty && _hasReadableChars(s))
+        .toList();
+    if (parts.isEmpty) return '';
+    return parts.join(' ').trim();
+  }
+
+  /// 判断字符串是否含有可读字符（中文/字母/数字）
+  static bool _hasReadableChars(String s) {
+    for (final code in s.runes) {
+      // CJK 统一汉字范围
+      if (code >= 0x4E00 && code <= 0x9FFF) return true;
+      // CJK 扩展A
+      if (code >= 0x3400 && code <= 0x4DBF) return true;
+      // 基本拉丁字母
+      if (code >= 0x41 && code <= 0x5A) return true; // A-Z
+      if (code >= 0x61 && code <= 0x7A) return true; // a-z
+      // 数字
+      if (code >= 0x30 && code <= 0x39) return true;
+    }
+    return false;
   }
 
   /// 清理 OFD TextCode 内的绘图指令噪声
-  /// OFD 中字形可能以 'G' 后跟 base64 编码出现，与正常文字混在 TextCode 中较罕见。
-  /// 这里保留所有人类可读字符（去掉控制字符），不做激进替换以保证真实文字不丢。
   static String _cleanOfdText(String s) {
     final buf = StringBuffer();
     for (final code in s.runes) {
@@ -122,7 +180,6 @@ class OfdTextExtractor {
       final v = m.group(1) ?? m.group(2);
       if (v != null) return int.tryParse(v) ?? 0;
     }
-    // 退化：尝试匹配 _Page_ 后数字
     final m2 = RegExp(r'/Page[_/](\d+)').firstMatch(path);
     if (m2 != null) return int.tryParse(m2.group(1)!) ?? 0;
     return 0;
@@ -133,7 +190,6 @@ class OfdTextExtractor {
     if (data is String) return data;
     if (data is List) {
       final bytes = List<int>.from(data);
-      // ofd 内 XML 强制 UTF-8，必须用 utf8.decode 正确解析多字节中文
       return utf8.decode(bytes, allowMalformed: true);
     }
     return data.toString();

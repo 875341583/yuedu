@@ -11,6 +11,7 @@ library;
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -773,12 +774,32 @@ class _PdfReaderPageState extends State<PdfReaderPage>
       if (controller == null) {
         return const Center(child: CircularProgressIndicator());
       }
-      return GestureDetector(
-        behavior: HitTestBehavior.translucent,
-        onTap: _toggleMenu,
-        onLongPressStart: _handleLongPressStart,
-        onLongPressMoveUpdate: _handleLongPressMove,
-        onLongPressEnd: _handleLongPressEnd,
+      // v0.8.2 修复手势竞争：slide 模式下 PageView 自带拖拽，
+      // 外层只注册 tap（三分法翻页）和 longPress（高亮），不冲突。
+      // 但 tap 需用 TapGestureRecognizer + 三分法逻辑（和 ReaderPage 一致）。
+      return RawGestureDetector(
+        behavior: HitTestBehavior.opaque,
+        gestures: <Type, GestureRecognizerFactory>{
+          TapGestureRecognizer:
+              GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+            () => TapGestureRecognizer(),
+            (TapGestureRecognizer instance) {
+              instance.onTapUp = _handleTapUp;
+            },
+          ),
+          LongPressGestureRecognizer:
+              GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+            () => LongPressGestureRecognizer(
+              duration: const Duration(milliseconds: 400),
+              postAcceptSlopTolerance: 64.0,
+            ),
+            (LongPressGestureRecognizer instance) {
+              instance.onLongPressStart = _handleLongPressStart;
+              instance.onLongPressMoveUpdate = _handleLongPressMove;
+              instance.onLongPressEnd = _handleLongPressEnd;
+            },
+          ),
+        },
         child: PageView.builder(
           controller: controller,
           itemCount: _pageCount,
@@ -799,15 +820,44 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     return LayoutBuilder(
       builder: (context, constraints) {
         _pageFullWidth = constraints.maxWidth;
-        return GestureDetector(
-          behavior: HitTestBehavior.translucent,
-          onTapUp: _handleTapUp,
-          onHorizontalDragStart: _handleDragStart,
-          onHorizontalDragUpdate: _handleDragUpdate,
-          onHorizontalDragEnd: _handleDragEnd,
-          onLongPressStart: _handleLongPressStart,
-          onLongPressMoveUpdate: _handleLongPressMove,
-          onLongPressEnd: _handleLongPressEnd,
+        // v0.8.2 修复手势竞争：非 slide 模式下 onHorizontalDrag 与 onLongPress
+        // 同时注册会导致长按被拖拽抢走竞技场。改用 RawGestureDetector：
+        //   - 自定义 _LargerSlopHorizontalDragGestureRecognizer 阈值 32px
+        //   - LongPress deadline 400ms + postAcceptSlopTolerance 64px
+        //   - TapGestureRecognizer 用于三分法翻页
+        return RawGestureDetector(
+          behavior: HitTestBehavior.opaque,
+          gestures: <Type, GestureRecognizerFactory>{
+            TapGestureRecognizer:
+                GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+              () => TapGestureRecognizer(),
+              (TapGestureRecognizer instance) {
+                instance.onTapUp = _handleTapUp;
+              },
+            ),
+            _LargerSlopHorizontalDragGestureRecognizer:
+                GestureRecognizerFactoryWithHandlers<
+                    _LargerSlopHorizontalDragGestureRecognizer>(
+              () => _LargerSlopHorizontalDragGestureRecognizer(),
+              (_LargerSlopHorizontalDragGestureRecognizer instance) {
+                instance.onStart = _handleDragStart;
+                instance.onUpdate = _handleDragUpdate;
+                instance.onEnd = _handleDragEnd;
+              },
+            ),
+            LongPressGestureRecognizer:
+                GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+              () => LongPressGestureRecognizer(
+                duration: const Duration(milliseconds: 400),
+                postAcceptSlopTolerance: 64.0,
+              ),
+              (LongPressGestureRecognizer instance) {
+                instance.onLongPressStart = _handleLongPressStart;
+                instance.onLongPressMoveUpdate = _handleLongPressMove;
+                instance.onLongPressEnd = _handleLongPressEnd;
+              },
+            ),
+          },
           child: _buildPageTurnView(doc),
         );
       },
@@ -823,7 +873,9 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   Widget _buildPdfPage(PdfDocument doc, int pageNumber) {
     final cropBounds = _getCropBoundsForPage(pageNumber);
     final isCurrentPage = pageNumber == (_pageNumber ?? 1);
-    final showManualCropOverlay = _cropMode == CropMode.manual && isCurrentPage;
+    final showManualCropOverlay = _cropMode == CropMode.manual
+        && isCurrentPage
+        && _manualCropRect == null; // 确认裁切后不再显示overlay
 
     return KeyedSubtree(
       key: ValueKey('pdf_page_$pageNumber'),
@@ -1021,8 +1073,8 @@ class _PdfReaderPageState extends State<PdfReaderPage>
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('裁切区域已应用，内容将拉伸填充全屏'),
-        duration: Duration(seconds: 2),
+        content: Text('裁切区域已应用，内容将拉伸填充全屏。如需重新裁切，请再次点击裁白边按钮选择"手动裁切"'),
+        duration: Duration(seconds: 3),
       ),
     );
   }
@@ -2192,5 +2244,15 @@ class _ManualCropPainter extends CustomPainter {
     return oldDelegate.cropStart != cropStart ||
         oldDelegate.cropCurrent != cropCurrent ||
         oldDelegate.confirmedRect != confirmedRect;
+  }
+}
+
+/// 自定义水平拖拽手势识别器 — 提高初始阈值到 32px，
+/// 给长按高亮留出静止识别窗口，避免长按被拖拽抢走竞技场。
+/// 复用 ReaderPage 的方案（v0.5.4 修复手势竞争）。
+class _LargerSlopHorizontalDragGestureRecognizer
+    extends HorizontalDragGestureRecognizer {
+  _LargerSlopHorizontalDragGestureRecognizer({super.supportedDevices}) {
+    gestureSettings = const DeviceGestureSettings(touchSlop: 32.0);
   }
 }
