@@ -13,6 +13,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'plugin.dart';
 import 'builtin/file_category_plugin.dart';
 import 'builtin/highlight_plugin.dart';
+import 'builtin/text_reflow_plugin.dart';
+import 'builtin/ocr_reflow_plugin.dart';
+import 'builtin/ai_layout_plugin.dart';
 
 /// 启用状态变化通知回调
 typedef PluginStateCallback = void Function(String pluginId, bool enabled);
@@ -58,6 +61,9 @@ class PluginManager extends ChangeNotifier {
     // 注册内置插件
     _register(FileCategoryPlugin());
     _register(HighlightPlugin());
+    _register(TextReflowPlugin());
+    _register(OcrReflowPlugin());
+    _register(AiLayoutPlugin());
 
     // 读取持久化
     try {

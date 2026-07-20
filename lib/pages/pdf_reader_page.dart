@@ -17,6 +17,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/book.dart';
 import '../services/bookshelf_service.dart';
+import '../pdf/pdf_engines.dart';
 
 /// PDF 视图模式：scroll=连续滚动，page=单页分页翻页
 enum PdfViewMode { scroll, page }
@@ -186,6 +187,28 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   /// 当前选中的颜色索引
   int _highlightColorIndex = 0;
 
+  // ─── v0.8.0 PDF 增强功能 ────────────────────────────────────
+  /// 裁白边模式
+  CropMode _cropMode = CropMode.off;
+
+  /// 适配模式
+  PdfFitMode _fitMode = PdfFitMode.fitWidth;
+
+  /// 逐页裁切结果缓存（pageNumber → PdfCropRegion）
+  final Map<int, PdfCropRegion> _cropRegions = {};
+
+  /// 统一裁切结果
+  PdfCropRegion? _unifiedCropRegion;
+
+  /// 裁切计算是否进行中
+  bool _cropComputing = false;
+
+  /// 裁切计算进度（已计算页数 / 总页数）
+  double _cropProgress = 0.0;
+
+  /// 分栏检测结果缓存（pageNumber → ColumnDetectionResult）
+  final Map<int, ColumnDetectionResult> _columnResults = {};
+
   @override
   void initState() {
     super.initState();
@@ -205,6 +228,8 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     _viewMode = await _loadViewMode();
     _orientMode = await _loadOrientMode();
     _turnMode = await _loadTurnMode();
+    _cropMode = await _loadCropMode();
+    _fitMode = await AdaptiveZoomEngine.loadFitMode();
     _applyOrientation(_orientMode);
     _initialPage = await _loadSavedPage();
     await _loadHighlights();
@@ -379,6 +404,122 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     } catch (_) {}
   }
 
+  // ─── 裁白边模式持久化 ────────────────────────────────────
+
+  static const _kPdfCropModeKey = 'yuedu_pdf_crop_mode';
+
+  Future<CropMode> _loadCropMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final idx = prefs.getInt(_kPdfCropModeKey) ?? 0;
+      return CropMode.values[idx.clamp(0, CropMode.values.length - 1)];
+    } catch (_) {
+      return CropMode.off;
+    }
+  }
+
+  Future<void> _saveCropMode(CropMode mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_kPdfCropModeKey, mode.index);
+    } catch (_) {}
+  }
+
+  Future<void> _changeCropMode(CropMode mode) async {
+    if (mode == _cropMode) return;
+    setState(() {
+      _cropMode = mode;
+      _showMenu = false;
+    });
+    await _saveCropMode(mode);
+    // 如果切换到需要裁切数据的模式，启动计算
+    if (mode != CropMode.off && _document != null && _cropRegions.isEmpty) {
+      _computeCropRegions();
+    }
+  }
+
+  Future<void> _changeFitMode(PdfFitMode mode) async {
+    if (mode == _fitMode) return;
+    setState(() => _fitMode = mode);
+    await AdaptiveZoomEngine.saveFitMode(mode);
+  }
+
+  /// 后台计算裁白边数据
+  Future<void> _computeCropRegions() async {
+    final doc = _document;
+    if (doc == null || _cropComputing) return;
+    setState(() {
+      _cropComputing = true;
+      _cropProgress = 0.0;
+    });
+
+    final total = doc.pages.length;
+    final perPageResults = <PdfCropRegion?>[];
+
+    for (int i = 0; i < total; i++) {
+      try {
+        final page = doc.pages[i];
+        final region = await AutoCropEngine.computeForPage(page);
+        perPageResults.add(region);
+        if (region != null) {
+          _cropRegions[page.pageNumber] = region;
+        }
+      } catch (_) {
+        perPageResults.add(null);
+      }
+      if (!mounted) return;
+      setState(() {
+        _cropProgress = (i + 1) / total;
+      });
+    }
+
+    // 计算统一裁切
+    if (perPageResults.any((r) => r != null)) {
+      _unifiedCropRegion = AutoCropEngine.computeUnified(
+        perPageResults,
+        pageWidth: doc.pages.isNotEmpty ? doc.pages[0].width : 612.0,
+        pageHeight: doc.pages.isNotEmpty ? doc.pages[0].height : 792.0,
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _cropComputing = false;
+      _cropProgress = 1.0;
+    });
+  }
+
+  /// 获取指定页的裁切区域
+  PdfRect? _getCropBoundsForPage(int pageNumber) {
+    switch (_cropMode) {
+      case CropMode.off:
+        return null;
+      case CropMode.perPage:
+        return _cropRegions[pageNumber]?.cropBounds;
+      case CropMode.unified:
+        return _unifiedCropRegion?.cropBounds;
+    }
+  }
+
+  // ─── 分栏检测 ──────────────────────────────────────────
+
+  Future<void> _detectColumnsForCurrentPage() async {
+    final doc = _document;
+    if (doc == null) return;
+    final current = _pageNumber ?? 1;
+    if (_columnResults.containsKey(current)) return;
+
+    try {
+      final page = doc.pages[current - 1];
+      final result = await ColumnDetector.detectForPage(page);
+      if (result != null && mounted) {
+        setState(() {
+          _columnResults[current] = result;
+        });
+      }
+    } catch (_) {}
+  }
+
   /// 加载 PdfDocument（分页模式用）
   Future<void> _loadDocument() async {
     if (_document != null || _docLoading) return;
@@ -399,6 +540,10 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         _pageNumber ??= _initialPage;
         _docLoading = false;
       });
+      // 如果裁白边模式开启，启动后台计算
+      if (_cropMode != CropMode.off) {
+        _computeCropRegions();
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -648,7 +793,11 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   ///
   /// 用 KeyedSubtree 按 pageNumber 标记，避免翻页末帧从多页 Stack 切回裸单页时
   /// 触发 PdfPageView 子树重建（pdfrx 重新解码位图），造成一帧白屏闪屏。
+  ///
+  /// v0.8.0：支持裁白边（CroppedPageView）和自适应缩放（InteractiveViewer）
   Widget _buildPdfPage(PdfDocument doc, int pageNumber) {
+    final cropBounds = _getCropBoundsForPage(pageNumber);
+
     return KeyedSubtree(
       key: ValueKey('pdf_page_$pageNumber'),
       child: Container(
@@ -656,12 +805,33 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
         child: LayoutBuilder(
           builder: (context, constraints) {
+            // 选择渲染方式
+            Widget pageWidget;
+            if (cropBounds != null && cropBounds.isNotEmpty) {
+              // 裁白边模式：使用 CroppedPageView 仅渲染内容区域
+              pageWidget = CroppedPageView(
+                document: doc,
+                pageNumber: pageNumber,
+                cropBounds: cropBounds,
+                backgroundColor: const Color(0xFF3A3A3A),
+              );
+            } else {
+              // 标准模式：使用 PdfPageView 渲染整页
+              pageWidget = PdfPageView(
+                document: doc,
+                pageNumber: pageNumber,
+                backgroundColor: const Color(0xFF3A3A3A),
+              );
+            }
+
             return Stack(
               children: [
-                PdfPageView(
-                  document: doc,
-                  pageNumber: pageNumber,
-                  backgroundColor: const Color(0xFF3A3A3A),
+                // 自适应缩放包裹：支持双指缩放和双击缩放
+                InteractiveViewer(
+                  minScale: 0.5,
+                  maxScale: 5.0,
+                  boundaryMargin: const EdgeInsets.all(50),
+                  child: pageWidget,
                 ),
                 // 高亮层：渲染当前页已有高亮 + 正在拖动的矩形
                 Positioned.fill(
@@ -1285,6 +1455,12 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     final mode = _viewMode == PdfViewMode.page
         ? '  分页·${_pdfTurnModeNames[_turnMode]}'
         : '  滚动';
+    final cropInfo = _cropMode != CropMode.off
+        ? '  ·裁白边${_cropMode == CropMode.perPage ? '(逐页)' : '(统一)'}'
+        : '';
+    final fitInfo = _viewMode == PdfViewMode.page
+        ? '  ·${_fitMode == PdfFitMode.fitWidth ? '宽适配' : _fitMode == PdfFitMode.fitHeight ? '高适配' : '页适配'}'
+        : '';
     return Positioned(
       bottom: 16,
       left: 0,
@@ -1299,7 +1475,7 @@ class _PdfReaderPageState extends State<PdfReaderPage>
               borderRadius: BorderRadius.circular(20),
             ),
             child: Text(
-              '$current / $total  ($percent%)$mode  · 点击呼出菜单',
+              '$current / $total  ($percent%)$mode$cropInfo$fitInfo  · 点击呼出菜单',
               style: const TextStyle(color: Colors.white, fontSize: 12),
             ),
           ),
@@ -1362,6 +1538,91 @@ class _PdfReaderPageState extends State<PdfReaderPage>
               }).toList(),
             ),
           if (_viewMode == PdfViewMode.page) const SizedBox(height: 8),
+          // ── v0.8.0: 裁白边模式切换 ──
+          PopupMenuButton<CropMode>(
+            icon: _floatIcon(
+              _cropMode == CropMode.off
+                  ? Icons.crop_free
+                  : Icons.crop_landscape,
+            ),
+            tooltip: '裁白边',
+            onSelected: _changeCropMode,
+            color: Colors.black87,
+            itemBuilder: (ctx) {
+              final cropNames = {
+                CropMode.off: '关闭',
+                CropMode.perPage: '逐页裁切',
+                CropMode.unified: '统一裁切',
+              };
+              return CropMode.values.map((m) {
+                return PopupMenuItem<CropMode>(
+                  value: m,
+                  child: Row(
+                    children: [
+                      Icon(
+                        _cropMode == m
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                        size: 18,
+                        color: Colors.white,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(cropNames[m]!,
+                          style: const TextStyle(color: Colors.white)),
+                      if (m == CropMode.perPage)
+                        const Text('  (每页独立)',
+                            style: TextStyle(color: Colors.white38, fontSize: 11)),
+                      if (m == CropMode.unified)
+                        const Text('  (所有页统一)',
+                            style: TextStyle(color: Colors.white38, fontSize: 11)),
+                    ],
+                  ),
+                );
+              }).toList();
+            },
+          ),
+          const SizedBox(height: 8),
+          // ── v0.8.0: 适配模式切换（仅分页模式）──
+          if (_viewMode == PdfViewMode.page)
+            PopupMenuButton<PdfFitMode>(
+              icon: _floatIcon(
+                _fitMode == PdfFitMode.fitWidth
+                    ? Icons.fit_screen
+                    : _fitMode == PdfFitMode.fitHeight
+                        ? Icons.height_outlined
+                        : Icons.fullscreen,
+              ),
+              tooltip: '适配模式',
+              onSelected: _changeFitMode,
+              color: Colors.black87,
+              itemBuilder: (ctx) {
+                const fitNames = {
+                  PdfFitMode.fitWidth: '宽度适配',
+                  PdfFitMode.fitHeight: '高度适配',
+                  PdfFitMode.fitPage: '整页适配',
+                };
+                return PdfFitMode.values.map((m) {
+                  return PopupMenuItem<PdfFitMode>(
+                    value: m,
+                    child: Row(
+                      children: [
+                        Icon(
+                          _fitMode == m
+                              ? Icons.radio_button_checked
+                              : Icons.radio_button_unchecked,
+                          size: 18,
+                          color: Colors.white,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(fitNames[m]!,
+                            style: const TextStyle(color: Colors.white)),
+                      ],
+                    ),
+                  );
+                }).toList();
+              },
+            ),
+          if (_viewMode == PdfViewMode.page) const SizedBox(height: 8),
           // 方向切换
           PopupMenuButton<PdfOrientationMode>(
             icon: _floatIcon(Icons.screen_rotation),
@@ -1388,6 +1649,30 @@ class _PdfReaderPageState extends State<PdfReaderPage>
               );
             }).toList(),
           ),
+          // ── v0.8.0: 裁切计算进度指示器 ──
+          if (_cropComputing)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: SizedBox(
+                width: 44,
+                height: 44,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    CircularProgressIndicator(
+                      value: _cropProgress,
+                      strokeWidth: 2.5,
+                      backgroundColor: Colors.white24,
+                      valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+                    ),
+                    Text(
+                      '${(_cropProgress * 100).round()}',
+                      style: const TextStyle(color: Colors.white, fontSize: 10),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
       ),
     );

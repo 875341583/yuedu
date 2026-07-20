@@ -23,6 +23,7 @@ import 'package:flutter/material.dart';
 enum PluginType {
   fileManagement('文件管理', Icons.folder_outlined),
   readingEnhancement('阅读增强', Icons.auto_stories),
+  pdfReflow('PDF 重排', Icons.replay_outlined),
   aiModel('AI 模型', Icons.psychology),
   utility('工具', Icons.build_outlined);
 
