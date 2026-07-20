@@ -9,6 +9,7 @@ import '../models/book.dart';
 import '../utils/encoding.dart';
 import '../utils/docx_text_extractor.dart' deferred as docx;
 import '../utils/xlsx_text_extractor.dart' deferred as xlsx;
+import '../models/xlsx_data.dart';
 import '../utils/ofd_text_extractor.dart' deferred as ofd;
 import 'epub_parser.dart' deferred as epub;
 import 'pdf_parser.dart';
@@ -572,6 +573,33 @@ class BookshelfService {
       final text = xlsx.XlsxTextExtractor.extract(bytes);
       _contentCache[book.id] = text;
       return text;
+    } catch (e) {
+      if (e is Exception) rethrow;
+      throw Exception('XLSX解析异常: $e');
+    }
+  }
+
+  /// XLSX 结构化数据缓存：bookId → XlsxWorkbook
+  final Map<String, XlsxWorkbook> _xlsxWorkbookCache = {};
+
+  /// 读取XLSX结构化数据（供 XlsxReaderPage 使用）
+  Future<XlsxWorkbook> readXlsxContentStructured(Book book) async {
+    if (_xlsxWorkbookCache.containsKey(book.id)) {
+      return _xlsxWorkbookCache[book.id]!;
+    }
+    if (book.filePath.isEmpty) {
+      return XlsxWorkbook(sheets: [], sheetNames: []);
+    }
+    final exists = await FileService.fileExists(book.filePath);
+    if (!exists) {
+      return XlsxWorkbook(sheets: [], sheetNames: []);
+    }
+    try {
+      await xlsx.loadLibrary();
+      final bytes = await FileService.readFileBytes(book.filePath);
+      final workbook = xlsx.XlsxTextExtractor.extractStructured(bytes);
+      _xlsxWorkbookCache[book.id] = workbook;
+      return workbook;
     } catch (e) {
       if (e is Exception) rethrow;
       throw Exception('XLSX解析异常: $e');

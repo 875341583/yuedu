@@ -4,18 +4,16 @@
 ///   - xl/sharedStrings.xml  → 全局共享字符串表 <sst><si><t>文本</t></si></sst>
 ///   - xl/workbook.xml       → sheet 名称与顺序
 ///   - xl/worksheets/sheetN.xml → 每个 sheet 的单元格数据
-///                              <c r="A1" t="s"><v>0</v></c>  (t="s"引用共享表下标0)
-///                              <c r="B2"><v>123</v></c>       (无 t，数字直接取 <v>)
-///                              <c r="C3" t="inlineStr"><is><t>内联</t></is></c>
+///   - xl/styles.xml          → 单元格样式（字体、背景色等）
 ///
-/// 输出：每个 sheet 一段，标题为 "=== Sheet名 ==="，行内单元格用 \t 分隔。
+/// v0.5.4 修复：
+///   - group(2) → group(1) 修复 RangeError 必崩
 ///
-/// v0.5.3 关键修复：
-///   1. archive 包内置 ZipDecoder 在某些 xlsx 上抛 RangeError 导致整个解析失败。
-///      本提取器先尝试 archive，若失败或返回异常数据，再用手写 ZIP 解析器兜底。
-///   2. 把 archive.file.content 的 RangeError 当作"此 sheet 解压失败"计入 sheetFailures，
-///      并把失败原因写进错误消息暴露给用户。
-///   3. _parseSheet 完全 try-catch 包裹，绝不向 sheet 循环抛异常。
+/// v0.7.0 重构：
+///   - 新增 extractStructured() 返回 XlsxWorkbook 结构化数据
+///   - 保留 extract() 旧接口向后兼容
+///   - 解析单元格坐标 r="A1" 实现空列占位
+///   - 解析 styles.xml 样式（背景色、加粗、斜体）
 library;
 
 import 'dart:convert';
@@ -23,22 +21,124 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:archive/archive.dart' as archive;
 
+import '../models/xlsx_data.dart';
+
 class XlsxTextExtractor {
+  /// 旧接口保留，内部调用 extractStructured 后降级为纯文本
   static String extract(List<int> bytes) {
-    // 文件头检测：区分 .xlsx（ZIP，PK\x03\x04）与 .xls（OLE2，D0CF11E0）
+    final workbook = extractStructured(bytes);
+    if (workbook.sheets.isEmpty) {
+      if (workbook.failureReasons.isNotEmpty) {
+        final reasons = workbook.failureReasons.take(3).join('；');
+        final more = workbook.failureReasons.length > 3
+            ? '；等共 ${workbook.failureReasons.length} 个工作表失败'
+            : '';
+        return '（表格解析失败：${workbook.failureReasons.length} 个工作表无法读取。'
+            '原因：$reasons$more）';
+      }
+      return '（此表格无可读文本单元格，可能为纯图表或图片型表格）';
+    }
+    final buffer = StringBuffer();
+    for (int i = 0; i < workbook.sheets.length; i++) {
+      final sheet = workbook.sheets[i];
+      if (buffer.isNotEmpty) buffer.write('\n\n');
+      buffer.write('=== ${sheet.name} ===\n');
+      for (final row in sheet.rows) {
+        if (row.isEmpty) continue;
+        final line = row.cells
+            .where((c) => c.hasValue)
+            .map((c) => c.value!)
+            .join('\t');
+        if (line.isNotEmpty) {
+          buffer.write(line);
+          buffer.write('\n');
+        }
+      }
+    }
+    return buffer.toString();
+  }
+
+  /// 新接口：返回结构化数据
+  static XlsxWorkbook extractStructured(List<int> bytes) {
+    // 文件头检测
     if (bytes.length < 4) {
       throw Exception('文件过小，不是有效的 XLSX 文件');
     }
-    // OLE2 复合文档头（.xls 旧格式）
-    if (bytes[0] == 0xD0 && bytes[1] == 0xCF && bytes[2] == 0x11 && bytes[3] == 0xE0) {
-      throw Exception('此文件是旧版 .xls 格式（二进制），请在电脑上用 Excel 另存为 .xlsx 格式后再导入');
+    if (bytes[0] == 0xD0 &&
+        bytes[1] == 0xCF &&
+        bytes[2] == 0x11 &&
+        bytes[3] == 0xE0) {
+      throw Exception(
+          '此文件是旧版 .xls 格式（二进制），请在电脑上用 Excel 另存为 .xlsx 格式后再导入');
     }
-    // ZIP 头检测
     if (!(bytes[0] == 0x50 && bytes[1] == 0x4B)) {
       throw Exception('文件格式不正确（不是有效的 .xlsx 压缩包），请确认文件未损坏');
     }
 
-    // v0.5.3 新方案：先尝试 archive 包，失败再用手写 ZIP 解析器
+    // 解压 ZIP
+    final files = _unzip(bytes);
+
+    if (files.isEmpty) {
+      throw Exception('XLSX 解压失败，文件可能已损坏或加密');
+    }
+
+    // 1. 解析 sharedStrings
+    final sharedStrings = _parseSharedStrings(files['xl/sharedStrings.xml']);
+
+    // 2. 解析 workbook.xml 获取 sheet 名称顺序
+    final sheetNames = _parseSheetNames(files['xl/workbook.xml']);
+
+    // 3. 解析 styles.xml
+    final styles = _parseStyles(files['xl/styles.xml']);
+
+    // 4. 收集所有 sheetN.xml，按 N 数字升序
+    final sheetFiles = <int, Uint8List>{};
+    for (final entry in files.entries) {
+      final m =
+          RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(entry.key);
+      if (m != null) {
+        final idx = int.parse(m.group(1)!);
+        sheetFiles[idx] = entry.value;
+      }
+    }
+    final sortedKeys = sheetFiles.keys.toList()..sort();
+
+    final sheets = <XlsxSheet>[];
+    final sheetNameList = <String>[];
+    final failureReasons = <String>[];
+
+    for (var i = 0; i < sortedKeys.length; i++) {
+      final idx = sortedKeys[i];
+      final f = sheetFiles[idx]!;
+      final sheetTitle = i < sheetNames.length ? sheetNames[i] : 'Sheet$idx';
+      sheetNameList.add(sheetTitle);
+
+      try {
+        final xml = utf8.decode(f, allowMalformed: true);
+        final sheet = _parseSheetStructured(xml, sheetTitle, sharedStrings, styles);
+        sheets.add(sheet);
+      } catch (e) {
+        failureReasons.add('$sheetTitle: $e');
+        // 添加空 sheet 占位
+        sheets.add(XlsxSheet(
+          name: sheetTitle,
+          rows: [],
+          maxColumnCount: 0,
+          hasHeader: false,
+        ));
+      }
+    }
+
+    return XlsxWorkbook(
+      sheets: sheets,
+      sheetNames: sheetNameList,
+      failureReasons: failureReasons,
+    );
+  }
+
+  // ─── 解压 ZIP ───
+
+  static Map<String, Uint8List> _unzip(List<int> bytes) {
     final files = <String, Uint8List>{};
     var archiveOk = false;
     String? archiveError;
@@ -54,7 +154,6 @@ class XlsxTextExtractor {
             files[f.name] = Uint8List.fromList(List<int>.from(data));
           }
         } catch (e) {
-          // 单个文件解压失败跳过，但记录原因
           archiveError ??= '$e';
         }
       }
@@ -62,127 +161,179 @@ class XlsxTextExtractor {
       archiveError = '$e';
     }
 
-    // 如果 archive 包没拿到任何文件，或拿到的关键文件不全，用手写 ZIP 解析器兜底
     if (!archiveOk || files.isEmpty || !files.containsKey('xl/workbook.xml')) {
       try {
         final manualFiles = _ManualZip.parse(bytes);
-        // 仅补充 archive 没拿到的文件
         for (final entry in manualFiles.entries) {
           files.putIfAbsent(entry.key, () => entry.value);
         }
       } catch (_) {
-        // 手写解析器也失败，继续用已有的 files（即使不完整）
+        // 手写解析器也失败
       }
     }
-
-    if (files.isEmpty) {
-      throw Exception(
-          'XLSX 解压失败：archive 包报错($archiveError)，手写解析器也未提取到任何文件，文件可能已损坏或加密');
-    }
-
-    // 1. 解析 sharedStrings（可能不存在；解析失败则置空，t="s" 单元格将跳过）
-    final sharedStrings = <String>[];
-    final ssBytes = files['xl/sharedStrings.xml'];
-    if (ssBytes != null) {
-      try {
-        final xml = utf8.decode(ssBytes, allowMalformed: true);
-        final siRE = RegExp(r'<si[\s>](.*?)</si>', dotAll: true);
-        final tRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
-        for (final siMatch in siRE.allMatches(xml)) {
-          final siContent = siMatch.group(1) ?? '';
-          final buf = StringBuffer();
-          for (final tMatch in tRE.allMatches(siContent)) {
-            buf.write(tMatch.group(1));
-          }
-          sharedStrings.add(_decodeXmlEntities(buf.toString()));
-        }
-      } catch (_) {
-        // sharedStrings 损坏不致命，继续解析表格
-      }
-    }
-
-    // 2. 解析 workbook.xml 获取 sheet 名称顺序
-    final sheetNames = <String>[];
-    final wbBytes = files['xl/workbook.xml'];
-    if (wbBytes != null) {
-      try {
-        final wbXml = utf8.decode(wbBytes, allowMalformed: true);
-        final nameRE = RegExp(r'<sheet\s[^>]*?name="([^"]+)"');
-        for (final m in nameRE.allMatches(wbXml)) {
-          sheetNames.add(_decodeXmlEntities(m.group(1)!));
-        }
-      } catch (_) {
-        // workbook 解析失败不致命，sheet 名退化为 SheetN
-      }
-    }
-
-    // 3. 收集所有 sheetN.xml，按 N 数字升序
-    final sheetFiles = <int, Uint8List>{};
-    for (final entry in files.entries) {
-      final m = RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(entry.key);
-      if (m != null) {
-        final idx = int.parse(m.group(1)!);
-        sheetFiles[idx] = entry.value;
-      }
-    }
-    final sortedKeys = sheetFiles.keys.toList()..sort();
-
-    final buffer = StringBuffer();
-    final failureReasons = <String>[];
-    for (var i = 0; i < sortedKeys.length; i++) {
-      final idx = sortedKeys[i];
-      final f = sheetFiles[idx]!;
-      final sheetTitle = i < sheetNames.length ? sheetNames[i] : 'Sheet$idx';
-
-      String sheetText = '';
-      try {
-        final xml = utf8.decode(f, allowMalformed: true);
-        sheetText = _parseSheet(xml, sharedStrings);
-      } catch (e) {
-        // 单 sheet 解析失败，记录具体原因，不阻止其他表
-        failureReasons.add('$sheetTitle: $e');
-        continue;
-      }
-      if (sheetText.isNotEmpty) {
-        if (buffer.isNotEmpty) buffer.write('\n\n');
-        buffer.write('=== $sheetTitle ===\n');
-        buffer.write(sheetText);
-      }
-    }
-
-    if (buffer.isEmpty) {
-      if (failureReasons.isNotEmpty) {
-        // 把失败原因拼到错误消息里，方便定位真实问题
-        final reasons = failureReasons.take(3).join('；');
-        final more = failureReasons.length > 3
-            ? '；等共 ${failureReasons.length} 个工作表失败'
-            : '';
-        return '（表格解析失败：${failureReasons.length} 个工作表无法读取。'
-            '原因：$reasons$more）';
-      }
-      // 空表格不抛异常，返回友好提示（纯图表/图片型表格）
-      return '（此表格无可读文本单元格，可能为纯图表或图片型表格）';
-    }
-    return buffer.toString();
+    return files;
   }
 
-  static String _parseSheet(String xml, List<String> sharedStrings) {
-    final buffer = StringBuffer();
+  // ─── 解析 sharedStrings ───
+
+  static List<String> _parseSharedStrings(Uint8List? ssBytes) {
+    if (ssBytes == null) return [];
+    try {
+      final xml = utf8.decode(ssBytes, allowMalformed: true);
+      final siRE = RegExp(r'<si[\s>](.*?)</si>', dotAll: true);
+      final tRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
+      final result = <String>[];
+      for (final siMatch in siRE.allMatches(xml)) {
+        final siContent = siMatch.group(1) ?? '';
+        final buf = StringBuffer();
+        for (final tMatch in tRE.allMatches(siContent)) {
+          buf.write(tMatch.group(1));
+        }
+        result.add(_decodeXmlEntities(buf.toString()));
+      }
+      return result;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // ─── 解析 workbook.xml sheet 名称 ───
+
+  static List<String> _parseSheetNames(Uint8List? wbBytes) {
+    if (wbBytes == null) return [];
+    try {
+      final wbXml = utf8.decode(wbBytes, allowMalformed: true);
+      final nameRE = RegExp(r'<sheet\s[^>]*?name="([^"]+)"');
+      return nameRE
+          .allMatches(wbXml)
+          .map((m) => _decodeXmlEntities(m.group(1)!))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // ─── 解析 styles.xml ───
+
+  /// 样式索引 → 样式信息
+  static _XlsxStyles _parseStyles(Uint8List? stylesBytes) {
+    if (stylesBytes == null) return _XlsxStyles.empty();
+    try {
+      final xml = utf8.decode(stylesBytes, allowMalformed: true);
+
+      // 解析字体
+      final fonts = <_XlsxFont>[];
+      final fontRE =
+          RegExp(r'<font[^>]*>(.*?)</font>', dotAll: true);
+      for (final fontMatch in fontRE.allMatches(xml)) {
+        final content = fontMatch.group(1) ?? '';
+        final isBold = content.contains('<b/>') || content.contains('<b ');
+        final isItalic =
+            content.contains('<i/>') || content.contains('<i ');
+        // 解析颜色：<color rgb="FF000000"/> 或 <color theme="0"/>
+        String? color;
+        final colorMatch =
+            RegExp(r'<color\s+rgb="([A-Fa-f0-9]+)"').firstMatch(content);
+        if (colorMatch != null) {
+          color = colorMatch.group(1);
+        }
+        fonts.add(_XlsxFont(isBold: isBold, isItalic: isItalic, color: color));
+      }
+
+      // 解析填充背景色
+      final fills = <String?>[];
+      final fillRE =
+          RegExp(r'<fill[^>]*>(.*?)</fill>', dotAll: true);
+      for (final fillMatch in fillRE.allMatches(xml)) {
+        final content = fillMatch.group(1) ?? '';
+        // 背景色：<bgColor rgb="FFFF0000"/> 或 <patternFill><bgColor .../>
+        String? bgColor;
+        final bgMatch =
+            RegExp(r'<bgColor\s+rgb="([A-Fa-f0-9]+)"').firstMatch(content);
+        if (bgMatch != null) {
+          bgColor = bgMatch.group(1);
+        }
+        fills.add(bgColor);
+      }
+
+      // 解析单元格格式 xf：关联 fontId + fillId
+      final cellXfs = <_XlsxXf>[];
+      // 处理属性顺序不同的情况
+      final xfRE2 =
+          RegExp(r'<xf\s+([^>]+)>');
+      for (final xfMatch in xfRE2.allMatches(xml)) {
+        final attrs = xfMatch.group(1) ?? '';
+        final numFmtIdMatch = RegExp(r'numFmtId="(\d+)"').firstMatch(attrs);
+        final fontIdMatch = RegExp(r'fontId="(\d+)"').firstMatch(attrs);
+        final fillIdMatch = RegExp(r'fillId="(\d+)"').firstMatch(attrs);
+        cellXfs.add(_XlsxXf(
+          numFmtId: numFmtIdMatch != null
+              ? int.tryParse(numFmtIdMatch.group(1)!) ?? 0
+              : 0,
+          fontId:
+              fontIdMatch != null ? int.tryParse(fontIdMatch.group(1)!) ?? 0 : 0,
+          fillId:
+              fillIdMatch != null ? int.tryParse(fillIdMatch.group(1)!) ?? 0 : 0,
+        ));
+      }
+
+      return _XlsxStyles(fonts: fonts, fills: fills, cellXfs: cellXfs);
+    } catch (_) {
+      return _XlsxStyles.empty();
+    }
+  }
+
+  // ─── 结构化 Sheet 解析 ───
+
+  static XlsxSheet _parseSheetStructured(
+    String xml,
+    String sheetName,
+    List<String> sharedStrings,
+    _XlsxStyles styles,
+  ) {
     final rowRE = RegExp(r'<row\s[^>]*>(.*?)</row>', dotAll: true);
     final cellRE = RegExp(r'<c\s+([^>]*)>(.*?)</c>', dotAll: true);
     final vRE = RegExp(r'<v>([^<]*)</v>');
     final isRE = RegExp(r'<is>(.*?)</is>', dotAll: true);
     final tInlineRE = RegExp(r'<t(?:\s[^>]*)?>([^<]*)</t>');
 
+    final rows = <XlsxRow>[];
+    var maxColCount = 0;
+
     for (final rowMatch in rowRE.allMatches(xml)) {
       final rowContent = rowMatch.group(1) ?? '';
-      final lineBuf = StringBuffer();
+
+      // 提取行号
+      final rowAttrs = RegExp(r'<row\s+([^>]*)>').firstMatch(xml.substring(rowMatch.start, rowMatch.start + 100));
+      final rowAttrStr = rowAttrs?.group(1) ?? '';
+      final rowNumMatch = RegExp(r'r="(\d+)"').firstMatch(rowAttrStr);
+      final rowNum = rowNumMatch != null
+          ? int.tryParse(rowNumMatch.group(1)!) ?? 0
+          : rows.length + 1;
+
+      // 用 Map 收集单元格（key = 列序号），确保空列占位
+      final cellMap = <int, XlsxCell>{};
+
       for (final cellMatch in cellRE.allMatches(rowContent)) {
         final attrs = cellMatch.group(1) ?? '';
         final cellContent = cellMatch.group(2) ?? '';
+
+        // 解析坐标 r="A1"
+        final rMatch = RegExp(r'r="([A-Z]+)(\d+)"').firstMatch(attrs);
+        final columnLetter = rMatch?.group(1) ?? '';
+        final columnIndex = columnLetter.isNotEmpty
+            ? columnLetterToIndex(columnLetter)
+            : cellMap.length;
+
+        // 解析样式索引 s="3"
+        final sMatch = RegExp(r's="(\d+)"').firstMatch(attrs);
+        final styleIndex = sMatch != null ? int.tryParse(sMatch.group(1)!) : null;
+
+        // 解析单元格类型和值
         String? value;
         final tAttrMatch = RegExp(r't="([^"]+)"').firstMatch(attrs);
         final tAttr = tAttrMatch?.group(1);
+
         if (tAttr == 's') {
           final vMatch = vRE.firstMatch(cellContent);
           if (vMatch != null) {
@@ -208,19 +359,112 @@ class XlsxTextExtractor {
             value = vMatch.group(1);
           }
         }
-        if (value != null && value.isNotEmpty) {
-          if (lineBuf.isNotEmpty) lineBuf.write('\t');
-          lineBuf.write(value);
+
+        if (value != null) {
+          value = _decodeXmlEntities(value);
         }
+
+        // 查找样式
+        String? bgColor;
+        bool bold = false;
+        bool italic = false;
+        if (styleIndex != null && styleIndex < styles.cellXfs.length) {
+          final xf = styles.cellXfs[styleIndex];
+          if (xf.fontId < styles.fonts.length) {
+            final font = styles.fonts[xf.fontId];
+            bold = font.isBold;
+            italic = font.isItalic;
+          }
+          if (xf.fillId < styles.fills.length) {
+            bgColor = styles.fills[xf.fillId];
+          }
+        }
+
+        cellMap[columnIndex] = XlsxCell(
+          value: value,
+          columnLetter: columnLetter.isNotEmpty
+              ? columnLetter
+              : columnIndexToLetter(columnIndex),
+          columnIndex: columnIndex,
+          backgroundColor: bgColor,
+          isBold: bold,
+          isItalic: italic,
+        );
       }
-      final line = lineBuf.toString();
-      if (line.isNotEmpty) {
-        if (buffer.isNotEmpty) buffer.write('\n');
-        buffer.write(line);
+
+      if (cellMap.isNotEmpty) {
+        maxColCount = maxColCount > cellMap.length ? maxColCount : cellMap.length;
+
+        // 填充空列占位
+        final sortedKeys = cellMap.keys.toList()..sort();
+        final maxKey = sortedKeys.last;
+        maxColCount = maxColCount > (maxKey + 1) ? maxColCount : maxKey + 1;
+
+        final cells = <XlsxCell>[];
+        for (int col = 0; col < maxColCount; col++) {
+          if (cellMap.containsKey(col)) {
+            cells.add(cellMap[col]!);
+          } else {
+            cells.add(XlsxCell(
+              columnLetter: columnIndexToLetter(col),
+              columnIndex: col,
+            ));
+          }
+        }
+
+        final isEmpty = cells.every((c) => !c.hasValue);
+        rows.add(XlsxRow(
+          rowIndex: rowNum,
+          cells: cells,
+          isEmpty: isEmpty,
+        ));
       }
     }
-    return buffer.toString();
+
+    // 二次扫描确保所有行列数一致
+    if (rows.isNotEmpty) {
+      // 重新计算 maxColumnCount（取所有行中最大列索引+1）
+      for (final row in rows) {
+        if (row.cells.isNotEmpty) {
+          final lastCol = row.cells.last.columnIndex + 1;
+          if (lastCol > maxColCount) maxColCount = lastCol;
+        }
+      }
+      // 补齐所有行到 maxColCount
+      final normalizedRows = <XlsxRow>[];
+      for (final row in rows) {
+        if (row.cells.length < maxColCount) {
+          final paddedCells = List<XlsxCell>.from(row.cells);
+          for (int col = paddedCells.length; col < maxColCount; col++) {
+            paddedCells.add(XlsxCell(
+              columnLetter: columnIndexToLetter(col),
+              columnIndex: col,
+            ));
+          }
+          normalizedRows.add(XlsxRow(
+            rowIndex: row.rowIndex,
+            cells: paddedCells,
+            isEmpty: row.isEmpty,
+          ));
+        } else {
+          normalizedRows.add(row);
+        }
+      }
+      rows.clear();
+      rows.addAll(normalizedRows);
+    }
+
+    final hasHeader = rows.isNotEmpty ? guessHasHeader(rows.first) : false;
+
+    return XlsxSheet(
+      name: sheetName,
+      rows: rows,
+      maxColumnCount: maxColCount,
+      hasHeader: hasHeader,
+    );
   }
+
+  // ─── XML 实体解码 ───
 
   static String _decodeXmlEntities(String s) {
     try {
@@ -244,73 +488,92 @@ class XlsxTextExtractor {
   }
 }
 
-/// 手写 ZIP 解析器（不依赖 archive 包）
-///
-/// 仅支持 ZIP 格式（PK\x03\x04 local file header），处理常见的 stored(0) 和 deflate(8)
-/// 两种压缩方式。deflate 用 dart:io 的 ZLibDecoder(raw: true) 解压。
-/// 作为 archive 包在特殊 xlsx 上抛 RangeError 时的兜底方案。
+// ─── 样式内部数据结构 ───
+
+class _XlsxFont {
+  final bool isBold;
+  final bool isItalic;
+  final String? color; // 字体颜色
+  const _XlsxFont({this.isBold = false, this.isItalic = false, this.color});
+}
+
+class _XlsxXf {
+  final int numFmtId;
+  final int fontId;
+  final int fillId;
+  const _XlsxXf(
+      {required this.numFmtId, required this.fontId, required this.fillId});
+}
+
+class _XlsxStyles {
+  final List<_XlsxFont> fonts;
+  final List<String?> fills; // 背景色
+  final List<_XlsxXf> cellXfs;
+
+  const _XlsxStyles(
+      {required this.fonts, required this.fills, required this.cellXfs});
+
+  static _XlsxStyles empty() =>
+      const _XlsxStyles(fonts: [], fills: [], cellXfs: []);
+}
+
+// ─── 手写 ZIP 解析器（不依赖 archive 包） ───
+
 class _ManualZip {
   static Map<String, Uint8List> parse(List<int> bytes) {
     final result = <String, Uint8List>{};
     final data = bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
     var pos = 0;
     while (pos + 4 <= data.length) {
-      // Local file header signature: 0x04034b50
-      if (data[pos] != 0x50 || data[pos + 1] != 0x4B ||
-          data[pos + 2] != 0x03 || data[pos + 3] != 0x04) {
+      if (data[pos] != 0x50 ||
+          data[pos + 1] != 0x4B ||
+          data[pos + 2] != 0x03 ||
+          data[pos + 3] != 0x04) {
         break;
       }
       if (pos + 30 > data.length) break;
 
-      // 读取 local file header 字段（小端序）
       final compressionMethod = _readUint16(data, pos + 8);
       final compressedSize = _readUint32(data, pos + 18);
-      final uncompressedSize = _readUint32(data, pos + 22);
+      // uncompressedSize 在 data descriptor 模式下不可靠，由 actualCompressedSize 推算
+      _readUint32(data, pos + 22);
       final fileNameLength = _readUint16(data, pos + 26);
       final extraFieldLength = _readUint16(data, pos + 28);
 
       final dataStart = pos + 30 + fileNameLength + extraFieldLength;
       if (dataStart > data.length) break;
 
-      // 文件名
       final fileNameBytes = data.sublist(pos + 30, pos + 30 + fileNameLength);
       final fileName = utf8.decode(fileNameBytes, allowMalformed: true);
 
-      // 数据
       final actualCompressedSize = compressedSize > 0
           ? compressedSize
           : _findNextLocalHeader(data, dataStart) - dataStart;
       if (actualCompressedSize <= 0 ||
           dataStart + actualCompressedSize > data.length) {
-        // 无法定位下一个 header，停止
         break;
       }
 
-      final compressedData = data.sublist(dataStart, dataStart + actualCompressedSize);
+      final compressedData =
+          data.sublist(dataStart, dataStart + actualCompressedSize);
       Uint8List? fileData;
       try {
         if (compressionMethod == 0) {
-          // stored
           fileData = compressedData;
         } else if (compressionMethod == 8) {
-          // deflate (raw, no zlib header)
-          final decoded = ZLibDecoder(raw: true).convert(compressedData.toList());
+          final decoded =
+              ZLibDecoder(raw: true).convert(compressedData.toList());
           fileData = Uint8List.fromList(decoded);
         }
       } catch (_) {
-        // 解压失败跳过此文件
+        // 解压失败跳过
       }
 
       if (fileData != null && fileName.isNotEmpty && !fileName.endsWith('/')) {
         result[fileName] = fileData;
       }
 
-      // 移动到下一个 local file header
       pos = dataStart + actualCompressedSize;
-      // 兜底：如果 uncompressedSize 与实际不符，用 actualCompressedSize 推进
-      if (uncompressedSize > 0 && compressionMethod == 0) {
-        // stored，compressedSize 与 uncompressedSize 相同
-      }
     }
     return result;
   }
@@ -328,16 +591,18 @@ class _ManualZip {
         (data[offset + 3] << 24);
   }
 
-  /// 当 compressedSize 为 0（data descriptor 模式）时，扫描下一个 local header
   static int _findNextLocalHeader(Uint8List data, int from) {
     for (var i = from; i + 4 <= data.length; i++) {
-      if (data[i] == 0x50 && data[i + 1] == 0x4B &&
-          data[i + 2] == 0x03 && data[i + 3] == 0x04) {
+      if (data[i] == 0x50 &&
+          data[i + 1] == 0x4B &&
+          data[i + 2] == 0x03 &&
+          data[i + 3] == 0x04) {
         return i;
       }
-      // Central directory header 也标志着 local files 结束
-      if (data[i] == 0x50 && data[i + 1] == 0x4B &&
-          data[i + 2] == 0x01 && data[i + 3] == 0x02) {
+      if (data[i] == 0x50 &&
+          data[i + 1] == 0x4B &&
+          data[i + 2] == 0x01 &&
+          data[i + 3] == 0x02) {
         return i;
       }
     }
