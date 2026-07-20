@@ -267,8 +267,9 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         final h = PdfRectHighlight.fromJson(item as Map<String, dynamic>);
         _highlightsByPage.putIfAbsent(h.page, () => []).add(h);
       }
-    } catch (_) {
-      // 高亮加载失败不阻塞阅读
+    } catch (e) {
+      // 高亮加载失败不阻塞阅读，但记录便于排查
+      debugPrint('加载高亮失败: $e');
     }
   }
 
@@ -282,7 +283,9 @@ class _PdfReaderPageState extends State<PdfReaderPage>
           .toList();
       await prefs.setString(
           '$_kPdfHighlightsPrefix${widget.book.id}', jsonEncode(list));
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('保存高亮失败: $e');
+    }
   }
 
   Future<void> _maybeShowFirstHint() async {
@@ -1215,12 +1218,14 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         );
       },
     ).then((_) {
-      // 工具栏关闭后，如果没提交，清空 mark
-      if (_markStart != null && _markCurrent != null) {
-        // 检查是否已 commit 了
-        if (!_isMarking) {
-          // 如果是 commit 成功了，mark 已经清空；如果是 cancel 也清空
-        }
+      // 工具栏被遮罩点击/下拉关闭时，mark 不会被清理，避免幻影拖拽框残留
+      // 导致下次长按覆盖 _markStart 以及翻页后同一位置出现幻影框
+      if (_markStart != null || _markCurrent != null) {
+        setState(() {
+          _markStart = null;
+          _markCurrent = null;
+          _isMarking = false;
+        });
       }
     });
   }
@@ -1247,11 +1252,14 @@ class _PdfReaderPageState extends State<PdfReaderPage>
       relH: ((bottom - top) / pageSize.height).clamp(0.0, 1.0),
       colorIndex: colorIndex.clamp(0, _pdfHighlightColors.length - 1),
     );
+    // 使用新列表引用触发 shouldRepaint（避免原地 add 后引用不变不重绘）
     setState(() {
-      _highlightsByPage.putIfAbsent(pageNumber, () => []).add(highlight);
+      final existing = _highlightsByPage[pageNumber] ?? [];
+      _highlightsByPage[pageNumber] = [...existing, highlight];
       _markStart = null;
       _markCurrent = null;
     });
+    // fire-and-forget 保存，内部已 try-catch 并输出日志
     _saveHighlights();
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -1263,9 +1271,18 @@ class _PdfReaderPageState extends State<PdfReaderPage>
 
   /// 删除指定高亮
   void _deleteHighlight(String id) {
+    // 使用新列表引用触发 shouldRepaint（避免原地 removeWhere 不重绘）
     setState(() {
-      for (final list in _highlightsByPage.values) {
-        list.removeWhere((h) => h.id == id);
+      for (final entry in _highlightsByPage.entries.toList()) {
+        if (entry.value.any((h) => h.id == id)) {
+          final filtered =
+              entry.value.where((h) => h.id != id).toList();
+          if (filtered.isEmpty) {
+            _highlightsByPage.remove(entry.key);
+          } else {
+            _highlightsByPage[entry.key] = filtered;
+          }
+        }
       }
       _selectedHighlightId = null;
     });
@@ -1909,6 +1926,25 @@ class _PdfReaderPageState extends State<PdfReaderPage>
               );
             }).toList(),
           ),
+          // ── v0.8.3: 清空本页高亮（仅有高亮时显示）──
+          if (_hasHighlightsOnCurrentPage) ...[
+            const SizedBox(height: 8),
+            GestureDetector(
+              onTap: () {
+                _clearAllHighlightsOnPage();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('已清空本页高亮'),
+                    duration: Duration(seconds: 1),
+                  ),
+                );
+              },
+              child: Tooltip(
+                message: '清空本页高亮',
+                child: _floatIcon(Icons.delete_sweep_outlined),
+              ),
+            ),
+          ],
           // ── v0.8.0: 裁切计算进度指示器 ──
           if (_cropComputing)
             Padding(
@@ -2046,10 +2082,18 @@ class _PdfHighlightPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _PdfHighlightPainter oldDelegate) {
-    return oldDelegate.existing != existing ||
-        oldDelegate.markStart != markStart ||
-        oldDelegate.markCurrent != markCurrent ||
-        oldDelegate.selectedId != selectedId;
+    // 改为值比较：之前用引用比较，原地 add/remove 后引用不变导致不重绘
+    if (oldDelegate.existing.length != existing.length) return true;
+    if (oldDelegate.markStart != markStart) return true;
+    if (oldDelegate.markCurrent != markCurrent) return true;
+    if (oldDelegate.selectedId != selectedId) return true;
+    // 内容比较（长度相同但 id/颜色变化时也要重绘）
+    for (var i = 0; i < existing.length; i++) {
+      final a = oldDelegate.existing[i];
+      final b = existing[i];
+      if (a.id != b.id || a.colorIndex != b.colorIndex) return true;
+    }
+    return false;
   }
 }
 

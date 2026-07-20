@@ -136,7 +136,13 @@ class OfdTextExtractor {
   /// 提取 XML 中所有标签外的可读文本（终极 fallback）
   static String _extractAllReadableText(String xml) {
     // 去掉所有 XML 标签，只留文本内容
-    final textOnly = xml.replaceAll(RegExp(r'<[^>]+>'), ' ');
+    var textOnly = xml.replaceAll(RegExp(r'<[^>]+>'), ' ');
+    // 去除 SVG/Draw 路径指令数据（如 "L 172.549 Q 8.549 12.3" 这类矢量绘图命令）
+    // 路径命令字母：M L C Q Z H V A S T（含大小写），后跟坐标数字
+    textOnly = textOnly.replaceAll(
+      RegExp(r'\b[MmLlCcQqZzHhVvAaSsTt]\s+(-?\d+(?:\.\d+)?\s*,?\s*)+'),
+      ' ',
+    );
     // 按空白分割，过滤掉纯符号/纯数字/空串
     final parts = textOnly
         .split(RegExp(r'\s+'))
@@ -146,20 +152,36 @@ class OfdTextExtractor {
     return parts.join(' ').trim();
   }
 
-  /// 判断字符串是否含有可读字符（中文/字母/数字）
+  /// 判断字符串是否含有可读字符
+  /// 要求：至少一个中文，或至少两个连续拉丁字母
+  /// 这样可排除单个路径命令字母 L/Q/M/C/Z 等被误判为可读文本
   static bool _hasReadableChars(String s) {
+    bool hasCJK = false;
+    int consecutiveLetters = 0;
+    int maxConsecutiveLetters = 0;
     for (final code in s.runes) {
       // CJK 统一汉字范围
-      if (code >= 0x4E00 && code <= 0x9FFF) return true;
+      if (code >= 0x4E00 && code <= 0x9FFF) {
+        hasCJK = true;
+        break;
+      }
       // CJK 扩展A
-      if (code >= 0x3400 && code <= 0x4DBF) return true;
+      if (code >= 0x3400 && code <= 0x4DBF) {
+        hasCJK = true;
+        break;
+      }
       // 基本拉丁字母
-      if (code >= 0x41 && code <= 0x5A) return true; // A-Z
-      if (code >= 0x61 && code <= 0x7A) return true; // a-z
-      // 数字
-      if (code >= 0x30 && code <= 0x39) return true;
+      if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) {
+        consecutiveLetters++;
+        if (consecutiveLetters > maxConsecutiveLetters) {
+          maxConsecutiveLetters = consecutiveLetters;
+        }
+      } else {
+        consecutiveLetters = 0;
+      }
     }
-    return false;
+    // 至少一个中文，或至少两个连续字母（排除单个 L/Q/M 等路径命令字母）
+    return hasCJK || maxConsecutiveLetters >= 2;
   }
 
   /// 清理 OFD TextCode 内的绘图指令噪声

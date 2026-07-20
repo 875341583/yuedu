@@ -428,23 +428,21 @@ class _AiLayoutSettingsPanelState extends State<_AiLayoutSettingsPanel> {
           onChanged: (v) async => await plugin.setModel(v),
         ),
         const SizedBox(height: 28),
-        // 一键配置 SiliconFlow
-        if (_urlController.text.isEmpty && _keyController.text.isEmpty)
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: _fillSiliconFlowDefaults,
-              icon: const Icon(Icons.bolt, size: 20),
-              label: const Text('一键配置 SiliconFlow（DeepSeek-V3）'),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.indigo,
-                side: const BorderSide(color: Colors.indigo),
-                padding: const EdgeInsets.symmetric(vertical: 12),
-              ),
+        // 一键配置 SiliconFlow（v0.8.3 起始终显示，方便随时恢复推荐配置）
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _fillSiliconFlowDefaults,
+            icon: const Icon(Icons.bolt, size: 20),
+            label: const Text('一键配置 SiliconFlow（DeepSeek-V3）'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: Colors.indigo,
+              side: const BorderSide(color: Colors.indigo),
+              padding: const EdgeInsets.symmetric(vertical: 12),
             ),
           ),
-        if (_urlController.text.isEmpty && _keyController.text.isEmpty)
-          const SizedBox(height: 12),
+        ),
+        const SizedBox(height: 12),
         // 保存配置按钮
         SizedBox(
           width: double.infinity,
