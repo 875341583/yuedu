@@ -206,6 +206,18 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   /// 裁切计算进度（已计算页数 / 总页数）
   double _cropProgress = 0.0;
 
+  /// 手动裁切：是否正在拖动画裁切区域
+  bool _isManualCropping = false;
+
+  /// 手动裁切：拖动起点（屏幕坐标，相对于 PdfPageView 区域）
+  Offset? _manualCropStart;
+
+  /// 手动裁切：当前拖动点
+  Offset? _manualCropCurrent;
+
+  /// 手动裁切：已确认的裁切区域（相对页面 0~1 比例坐标）
+  Rect? _manualCropRect;
+
   /// 分栏检测结果缓存（pageNumber → ColumnDetectionResult）
   final Map<int, ColumnDetectionResult> _columnResults = {};
 
@@ -498,6 +510,19 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         return _cropRegions[pageNumber]?.cropBounds;
       case CropMode.unified:
         return _unifiedCropRegion?.cropBounds;
+      case CropMode.manual:
+        // 手动裁切：将相对坐标矩形转换为 PdfRect（PDF 坐标系）
+        final rect = _manualCropRect;
+        if (rect == null) return null;
+        final doc = _document;
+        if (doc == null || pageNumber < 1 || pageNumber > doc.pages.length) return null;
+        final page = doc.pages[pageNumber - 1];
+        // 相对坐标 → PDF 坐标系（原点左下角，Y 向上）
+        final left = rect.left * page.width;
+        final right = rect.right * page.width;
+        final top = (1.0 - rect.top) * page.height;   // PDF 坐标系 top 对应 Flutter bottom
+        final bottom = (1.0 - rect.bottom) * page.height;
+        return PdfRect(left, top, right, bottom);
     }
   }
 
@@ -797,6 +822,8 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   /// v0.8.0：支持裁白边（CroppedPageView）和自适应缩放（InteractiveViewer）
   Widget _buildPdfPage(PdfDocument doc, int pageNumber) {
     final cropBounds = _getCropBoundsForPage(pageNumber);
+    final isCurrentPage = pageNumber == (_pageNumber ?? 1);
+    final showManualCropOverlay = _cropMode == CropMode.manual && isCurrentPage;
 
     return KeyedSubtree(
       key: ValueKey('pdf_page_$pageNumber'),
@@ -805,15 +832,19 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
         child: LayoutBuilder(
           builder: (context, constraints) {
+            final viewSize = constraints.biggest;
+
             // 选择渲染方式
             Widget pageWidget;
             if (cropBounds != null && cropBounds.isNotEmpty) {
-              // 裁白边模式：使用 CroppedPageView 仅渲染内容区域
+              // 裁切模式：使用 CroppedPageView 仅渲染内容区域
+              // 手动裁切：拉伸填充全屏；自动裁切：保持宽高比
               pageWidget = CroppedPageView(
                 document: doc,
                 pageNumber: pageNumber,
                 cropBounds: cropBounds,
                 backgroundColor: const Color(0xFF3A3A3A),
+                stretchToFill: _cropMode == CropMode.manual,
               );
             } else {
               // 标准模式：使用 PdfPageView 渲染整页
@@ -835,14 +866,185 @@ class _PdfReaderPageState extends State<PdfReaderPage>
                 ),
                 // 高亮层：渲染当前页已有高亮 + 正在拖动的矩形
                 Positioned.fill(
-                  child: _buildHighlightLayer(pageNumber, constraints.biggest),
+                  child: _buildHighlightLayer(pageNumber, viewSize),
                 ),
+                // 手动裁切交互层
+                if (showManualCropOverlay)
+                  Positioned.fill(
+                    child: _buildManualCropOverlay(viewSize),
+                  ),
               ],
             );
           },
         ),
       ),
     );
+  }
+
+  /// 手动裁切交互层 — 半透明遮罩 + 拖动画矩形 + 确认/重置按钮
+  Widget _buildManualCropOverlay(Size viewSize) {
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onPanStart: (details) {
+        setState(() {
+          _isManualCropping = true;
+          _manualCropStart = details.localPosition - _kPdfInnerOffset;
+          _manualCropCurrent = _manualCropStart;
+        });
+      },
+      onPanUpdate: (details) {
+        if (!_isManualCropping) return;
+        setState(() {
+          _manualCropCurrent = details.localPosition - _kPdfInnerOffset;
+        });
+      },
+      onPanEnd: (details) {
+        if (!_isManualCropping) return;
+        setState(() {
+          _isManualCropping = false;
+        });
+        // 矩形过小则忽略
+        final s = _manualCropStart;
+        final c = _manualCropCurrent;
+        if (s == null || c == null) return;
+        final w = (c - s).dx.abs();
+        final h = (c - s).dy.abs();
+        if (w < 20 || h < 20) {
+          setState(() {
+            _manualCropStart = null;
+            _manualCropCurrent = null;
+          });
+          return;
+        }
+      },
+      child: Stack(
+        children: [
+          // 遮罩层 + 裁切矩形
+          Positioned.fill(
+            child: CustomPaint(
+              size: viewSize,
+              painter: _ManualCropPainter(
+                cropStart: _manualCropStart,
+                cropCurrent: _manualCropCurrent,
+                confirmedRect: _manualCropRect,
+                innerOffset: _kPdfInnerOffset,
+              ),
+            ),
+          ),
+          // 确认/重置按钮
+          if (_manualCropStart != null && _manualCropCurrent != null && !_isManualCropping)
+            Positioned(
+              bottom: 30,
+              left: 0,
+              right: 0,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _confirmManualCrop,
+                    icon: const Icon(Icons.check, size: 18),
+                    label: const Text('确认裁切'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.indigo,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  OutlinedButton.icon(
+                    onPressed: _resetManualCrop,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('重画'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white54),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  OutlinedButton.icon(
+                    onPressed: _clearManualCrop,
+                    icon: const Icon(Icons.close, size: 18),
+                    label: const Text('取消裁切'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white70,
+                      side: const BorderSide(color: Colors.white38),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          // 提示文字
+          if (_manualCropStart == null && _manualCropCurrent == null && _manualCropRect == null)
+            Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.7),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Text(
+                  '在页面上拖动画出裁切区域',
+                  style: TextStyle(color: Colors.white, fontSize: 15),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 确认手动裁切区域
+  void _confirmManualCrop() {
+    final s = _manualCropStart;
+    final c = _manualCropCurrent;
+    if (s == null || c == null) return;
+
+    final mediaSize = MediaQuery.of(context).size;
+    final viewW = mediaSize.width - _kPdfInnerOffset.dx * 2;
+    final viewH = mediaSize.height - _kPdfInnerOffset.dy * 2;
+
+    final left = math.min(s.dx, c.dx).clamp(0.0, viewW);
+    final top = math.min(s.dy, c.dy).clamp(0.0, viewH);
+    final right = math.max(s.dx, c.dx).clamp(0.0, viewW);
+    final bottom = math.max(s.dy, c.dy).clamp(0.0, viewH);
+
+    // 转为相对坐标（0~1）
+    setState(() {
+      _manualCropRect = Rect.fromLTWH(
+        left / viewW,
+        top / viewH,
+        (right - left) / viewW,
+        (bottom - top) / viewH,
+      );
+      _manualCropStart = null;
+      _manualCropCurrent = null;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('裁切区域已应用，内容将拉伸填充全屏'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  /// 重画裁切区域
+  void _resetManualCrop() {
+    setState(() {
+      _manualCropStart = null;
+      _manualCropCurrent = null;
+      _manualCropRect = null;
+    });
+  }
+
+  /// 取消手动裁切
+  void _clearManualCrop() {
+    setState(() {
+      _manualCropStart = null;
+      _manualCropCurrent = null;
+      _manualCropRect = null;
+      _cropMode = CropMode.off;
+    });
+    _saveCropMode(CropMode.off);
   }
 
   /// 高亮绘制层
@@ -1456,7 +1658,7 @@ class _PdfReaderPageState extends State<PdfReaderPage>
         ? '  分页·${_pdfTurnModeNames[_turnMode]}'
         : '  滚动';
     final cropInfo = _cropMode != CropMode.off
-        ? '  ·裁白边${_cropMode == CropMode.perPage ? '(逐页)' : '(统一)'}'
+        ? '  ·裁切${_cropMode == CropMode.perPage ? '(逐页)' : _cropMode == CropMode.unified ? '(统一)' : '(手动)'}'
         : '';
     final fitInfo = _viewMode == PdfViewMode.page
         ? '  ·${_fitMode == PdfFitMode.fitWidth ? '宽适配' : _fitMode == PdfFitMode.fitHeight ? '高适配' : '页适配'}'
@@ -1543,7 +1745,9 @@ class _PdfReaderPageState extends State<PdfReaderPage>
             icon: _floatIcon(
               _cropMode == CropMode.off
                   ? Icons.crop_free
-                  : Icons.crop_landscape,
+                  : _cropMode == CropMode.manual
+                      ? Icons.crop
+                      : Icons.crop_landscape,
             ),
             tooltip: '裁白边',
             onSelected: _changeCropMode,
@@ -1553,6 +1757,7 @@ class _PdfReaderPageState extends State<PdfReaderPage>
                 CropMode.off: '关闭',
                 CropMode.perPage: '逐页裁切',
                 CropMode.unified: '统一裁切',
+                CropMode.manual: '手动裁切',
               };
               return CropMode.values.map((m) {
                 return PopupMenuItem<CropMode>(
@@ -1570,10 +1775,13 @@ class _PdfReaderPageState extends State<PdfReaderPage>
                       Text(cropNames[m]!,
                           style: const TextStyle(color: Colors.white)),
                       if (m == CropMode.perPage)
-                        const Text('  (每页独立)',
+                        const Text('  (自动·每页独立)',
                             style: TextStyle(color: Colors.white38, fontSize: 11)),
                       if (m == CropMode.unified)
-                        const Text('  (所有页统一)',
+                        const Text('  (自动·所有页统一)',
+                            style: TextStyle(color: Colors.white38, fontSize: 11)),
+                      if (m == CropMode.manual)
+                        const Text('  (自由画区域)',
                             style: TextStyle(color: Colors.white38, fontSize: 11)),
                     ],
                   ),
@@ -1883,5 +2091,106 @@ class _PdfHighlightToolbar extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// 手动裁切区域画师 — 遮罩 + 裁切矩形
+class _ManualCropPainter extends CustomPainter {
+  final Offset? cropStart;
+  final Offset? cropCurrent;
+  final Rect? confirmedRect;
+  final Offset innerOffset;
+
+  const _ManualCropPainter({
+    required this.cropStart,
+    required this.cropCurrent,
+    required this.confirmedRect,
+    required this.innerOffset,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    // 半透明遮罩覆盖整个视图
+    final overlayPaint = Paint()..color = Colors.black.withOpacity(0.5);
+    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), overlayPaint);
+
+    // 确定裁切矩形
+    Rect? cropRect;
+    if (confirmedRect != null) {
+      // 已确认的裁切矩形（相对坐标 → 屏幕坐标）
+      cropRect = Rect.fromLTWH(
+        confirmedRect!.left * size.width + innerOffset.dx,
+        confirmedRect!.top * size.height + innerOffset.dy,
+        confirmedRect!.width * size.width,
+        confirmedRect!.height * size.height,
+      );
+    } else if (cropStart != null && cropCurrent != null) {
+      // 正在拖动的矩形
+      final s = cropStart! + innerOffset;
+      final c = cropCurrent! + innerOffset;
+      cropRect = Rect.fromPoints(s, c);
+    }
+
+    if (cropRect == null) return;
+
+    // 清除裁切矩形区域的遮罩（镂空效果）
+    canvas.save();
+    final clearPaint = Paint()..blendMode = BlendMode.clear;
+    canvas.drawRect(cropRect!, clearPaint);
+    canvas.restore();
+
+    // 绘制裁切矩形边框
+    final borderPaint = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+    canvas.drawRect(cropRect!, borderPaint);
+
+    // 绘制四角拖拽手柄
+    final handleSize = 12.0;
+    final handlePaint = Paint()..color = Colors.white;
+    final corners = [
+      cropRect!.topLeft,
+      cropRect!.topRight,
+      cropRect!.bottomLeft,
+      cropRect!.bottomRight,
+    ];
+    for (final corner in corners) {
+      canvas.drawRect(
+        Rect.fromCenter(center: corner, width: handleSize, height: handleSize),
+        handlePaint,
+      );
+    }
+
+    // 绘制尺寸标注
+    if (cropRect!.width > 60 && cropRect!.height > 30) {
+      final textStyle = TextStyle(
+        color: Colors.white,
+        fontSize: 11,
+        backgroundColor: Colors.black54,
+      );
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: '${cropRect!.width.round()}x${cropRect!.height.round()}',
+          style: textStyle,
+        ),
+        textDirection: TextDirection.ltr,
+      );
+      textPainter.layout();
+      textPainter.paint(
+        canvas,
+        Offset(
+          cropRect!.center.dx - textPainter.width / 2,
+          cropRect!.top - textPainter.height - 6,
+        ),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _ManualCropPainter oldDelegate) {
+    return oldDelegate.cropStart != cropStart ||
+        oldDelegate.cropCurrent != cropCurrent ||
+        oldDelegate.confirmedRect != confirmedRect;
   }
 }

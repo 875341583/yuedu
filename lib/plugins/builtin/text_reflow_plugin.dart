@@ -17,7 +17,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../plugin.dart';
-import '../../pdf/pdf_engines.dart';
+import '../plugin_manager.dart';
 
 class TextReflowPlugin extends YueDuPlugin {
   @override
@@ -87,6 +87,18 @@ class TextReflowPlugin extends YueDuPlugin {
       await prefs.setDouble(_kReflowLineHeight, height);
     } catch (_) {}
   }
+
+  /// 一键保存所有配置并返回是否成功
+  Future<bool> saveAllSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_kReflowFontSize, _fontSize);
+      await prefs.setDouble(_kReflowLineHeight, _lineHeight);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 }
 
 class _TextReflowSettingsPanel extends StatefulWidget {
@@ -98,9 +110,27 @@ class _TextReflowSettingsPanel extends StatefulWidget {
 }
 
 class _TextReflowSettingsPanelState extends State<_TextReflowSettingsPanel> {
+  /// 从 PluginManager 获取已注册的插件实例（单例）
+  TextReflowPlugin get _plugin {
+    final p = PluginManager.instance.all.where((p) => p.id == 'pdf_text_reflow').firstOrNull;
+    return p as TextReflowPlugin;
+  }
+
+  Future<void> _saveSettings() async {
+    final ok = await _plugin.saveAllSettings();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? '配置已保存' : '保存失败，请重试'),
+        duration: const Duration(seconds: 2),
+        backgroundColor: ok ? Colors.green : Colors.red,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final plugin = TextReflowPlugin();
+    final plugin = _plugin;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -174,6 +204,21 @@ class _TextReflowSettingsPanelState extends State<_TextReflowSettingsPanel> {
           '• 自定义重排模板\n'
           '• 重排结果导出',
           style: TextStyle(color: Colors.grey, fontSize: 13),
+        ),
+        const SizedBox(height: 28),
+        // 保存配置按钮
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            onPressed: _saveSettings,
+            icon: const Icon(Icons.save, size: 20),
+            label: const Text('保存配置'),
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.indigo,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+            ),
+          ),
         ),
       ],
     );

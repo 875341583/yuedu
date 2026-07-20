@@ -17,6 +17,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../plugin.dart';
+import '../plugin_manager.dart';
 
 class OcrReflowPlugin extends YueDuPlugin {
   @override
@@ -96,6 +97,19 @@ class OcrReflowPlugin extends YueDuPlugin {
       await prefs.setInt(_kOcrBackend, b.index);
     } catch (_) {}
   }
+
+  /// 一键保存所有配置并返回是否成功
+  Future<bool> saveAllSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kOcrApiUrl, _apiUrl);
+      await prefs.setString(_kOcrApiKey, _apiKey);
+      await prefs.setInt(_kOcrBackend, _backend.index);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 }
 
 /// OCR 后端选择
@@ -125,12 +139,17 @@ class _OcrReflowSettingsPanelState extends State<_OcrReflowSettingsPanel> {
   final _urlController = TextEditingController();
   final _keyController = TextEditingController();
 
+  /// 从 PluginManager 获取已注册的插件实例（单例）
+  OcrReflowPlugin get _plugin {
+    final p = PluginManager.instance.all.where((p) => p.id == 'pdf_ocr_reflow').firstOrNull;
+    return p as OcrReflowPlugin;
+  }
+
   @override
   void initState() {
     super.initState();
-    final plugin = OcrReflowPlugin();
-    _urlController.text = plugin.apiUrl;
-    _keyController.text = plugin.apiKey;
+    _urlController.text = _plugin.apiUrl;
+    _keyController.text = _plugin.apiKey;
   }
 
   @override
@@ -140,9 +159,23 @@ class _OcrReflowSettingsPanelState extends State<_OcrReflowSettingsPanel> {
     super.dispose();
   }
 
+  Future<void> _saveSettings() async {
+    await _plugin.setApiUrl(_urlController.text);
+    await _plugin.setApiKey(_keyController.text);
+    final ok = await _plugin.saveAllSettings();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? '配置已保存' : '保存失败，请重试'),
+        duration: const Duration(seconds: 2),
+        backgroundColor: ok ? Colors.green : Colors.red,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final plugin = OcrReflowPlugin();
+    final plugin = _plugin;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -199,6 +232,21 @@ class _OcrReflowSettingsPanelState extends State<_OcrReflowSettingsPanel> {
           ),
           obscureText: true,
           onChanged: (v) async => await plugin.setApiKey(v),
+        ),
+        const SizedBox(height: 28),
+        // 保存配置按钮
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            onPressed: _saveSettings,
+            icon: const Icon(Icons.save, size: 20),
+            label: const Text('保存配置'),
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.indigo,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+            ),
+          ),
         ),
       ],
     );

@@ -28,6 +28,9 @@ enum CropMode {
   /// 统一裁切（所有页取并集）
   unified,
 
+  /// 手动自由裁切（用户画区域）
+  manual,
+
   /// 不裁切
   off,
 }
@@ -272,12 +275,17 @@ class CroppedPageView extends StatefulWidget {
   final Color backgroundColor;
   final double maxDpi;
 
+  /// 是否将裁切区域拉伸填充全屏（手动裁切模式用）
+  /// true=BoxFit.fill 强制拉伸；false=BoxFit.contain 保持宽高比
+  final bool stretchToFill;
+
   const CroppedPageView({
     required this.document,
     required this.pageNumber,
     required this.cropBounds,
     this.backgroundColor = const Color(0xFF3A3A3A),
     this.maxDpi = 300,
+    this.stretchToFill = false,
     super.key,
   });
 
@@ -389,17 +397,29 @@ class _CroppedPageViewState extends State<CroppedPageView> {
             h = w / aspect;
           }
 
-          return Center(
-            child: SizedBox(
-              width: w,
-              height: h,
+          if (widget.stretchToFill) {
+            // 手动裁切：拉伸填充整个可用空间（不规则区域也强制填满）
+            return SizedBox.expand(
               child: RawImage(
                 image: _image,
-                fit: BoxFit.contain,
+                fit: BoxFit.fill,
                 filterQuality: FilterQuality.high,
               ),
-            ),
-          );
+            );
+          } else {
+            // 自动裁切：保持宽高比居中显示
+            return Center(
+              child: SizedBox(
+                width: w,
+                height: h,
+                child: RawImage(
+                  image: _image,
+                  fit: BoxFit.contain,
+                  filterQuality: FilterQuality.high,
+                ),
+              ),
+            );
+          }
         },
       ),
     );
