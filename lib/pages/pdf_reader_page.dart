@@ -605,6 +605,15 @@ class _PdfReaderPageState extends State<PdfReaderPage>
       final initialIndex = (currentPage - 1).clamp(0, maxIndex);
       _pageController = PageController(initialPage: initialIndex);
       setState(() {});
+      // C3: 提示用户文本选择仅在滚动模式可用
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('提示：文本选择和复制仅在滚动模式可用'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
     } else {
       // 切回滚动模式：延迟跳转到当前页
       setState(() {});
@@ -1106,14 +1115,72 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   Widget _buildHighlightLayer(int pageNumber, Size size) {
     final existing = _highlightsByPage[pageNumber] ?? [];
     final isCurrentPage = pageNumber == (_pageNumber ?? 1);
-    return CustomPaint(
-      size: Size.infinite,
-      painter: _PdfHighlightPainter(
-        existing: existing,
-        pageSize: size,
-        markStart: isCurrentPage ? _markStart : null,
-        markCurrent: isCurrentPage ? _markCurrent : null,
-        selectedId: isCurrentPage ? _selectedHighlightId : null,
+    // 检测点击是否命中某个已有高亮矩形
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTapUp: (details) {
+        if (!isCurrentPage || existing.isEmpty) return;
+        final tapPos = details.localPosition;
+        // 遍历高亮，用相对坐标转换为像素坐标做命中检测
+        for (final h in existing) {
+          final rect = Rect.fromLTWH(
+            h.relX * size.width,
+            h.relY * size.height,
+            h.relW * size.width,
+            h.relH * size.height,
+          );
+          if (rect.contains(tapPos)) {
+            // 选中或取消选中
+            if (_selectedHighlightId == h.id) {
+              // 已选中 → 弹出删除确认
+              _showHighlightDeleteDialog(h.id);
+            } else {
+             setState(() => _selectedHighlightId = h.id);
+            }
+            return;
+          }
+        }
+        // 点空白处取消选中
+        if (_selectedHighlightId != null) {
+          setState(() => _selectedHighlightId = null);
+        }
+      },
+      child: CustomPaint(
+        size: Size.infinite,
+        painter: _PdfHighlightPainter(
+          existing: existing,
+          pageSize: size,
+          markStart: isCurrentPage ? _markStart : null,
+          markCurrent: isCurrentPage ? _markCurrent : null,
+          selectedId: isCurrentPage ? _selectedHighlightId : null,
+        ),
+      ),
+    );
+  }
+
+  /// 弹出删除确认对话框（点击已选中的高亮时触发）
+  void _showHighlightDeleteDialog(String id) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除高亮'),
+        content: const Text('确定删除选中的高亮吗？'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              setState(() => _selectedHighlightId = null);
+            },
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _deleteHighlight(id);
+            },
+            child: const Text('删除'),
+          ),
+        ],
       ),
     );
   }
@@ -1244,7 +1311,7 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     final right = math.max(start.dx, current.dx);
     final bottom = math.max(start.dy, current.dy);
     final highlight = PdfRectHighlight(
-      id: 'pdf_h_${DateTime.now().millisecondsSinceEpoch}',
+      id: 'pdf_h_${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(0xFFFF)}',
       page: pageNumber,
       relX: (left / pageSize.width).clamp(0.0, 1.0),
       relY: (top / pageSize.height).clamp(0.0, 1.0),
