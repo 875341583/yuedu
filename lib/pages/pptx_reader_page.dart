@@ -8,6 +8,7 @@
 library;
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -388,7 +389,7 @@ class _PptxReaderPageState extends State<PptxReaderPage>
             _persistPage();
           },
           itemBuilder: (context, index) {
-            return _buildSlide(slides.pages[index]);
+            return _buildSlide(slides.slides[index], slides.slideSize);
           },
         ),
       );
@@ -426,7 +427,7 @@ class _PptxReaderPageState extends State<PptxReaderPage>
 
   Widget _buildPageTurnView(dynamic slides) {
     final currentPage =
-        _buildSlide(slides.pages[_currentPage - 1], key: ValueKey('pptx_page_$_currentPage'));
+        _buildSlide(slides.slides[_currentPage - 1], slides.slideSize, key: ValueKey('pptx_page_$_currentPage'));
 
     // 静态状态：用 Stack 包装保持 widget 树结构稳定。
     // 避免"动画末帧返回多子 Stack → 静态返回裸 Slide"的 runtimeType 突变，
@@ -445,7 +446,7 @@ class _PptxReaderPageState extends State<PptxReaderPage>
     if (_dragDir != 0) {
       final neighborIndex = _dragDir < 0 ? _currentPage - 2 : _currentPage;
       if (neighborIndex >= 0 && neighborIndex < slides.pageCount) {
-        neighborWidget = _buildSlide(slides.pages[neighborIndex],
+        neighborWidget = _buildSlide(slides.slides[neighborIndex], slides.slideSize,
             key: ValueKey('pptx_page_${neighborIndex + 1}'));
       }
     }
@@ -664,64 +665,225 @@ class _PptxReaderPageState extends State<PptxReaderPage>
     }
   }
 
-  /// 渲染单张幻灯片（白纸式排版，文本居中自适应）
-  Widget _buildSlide(String text, {Key? key}) {
-    return Container(
+  /// 渲染单张幻灯片（按原始布局还原）
+  ///
+  /// 将 PPTX 中每个形状按原始位置和尺寸用 Stack+Positioned 还原，
+  /// 文本字号、颜色、粗体等属性从 XML 提取后按缩放比例渲染。
+  Widget _buildSlide(dynamic slide, dynamic slideSize, {Key? key}) {
+    return SizedBox.expand(
       key: key,
-      margin: const EdgeInsets.all(24),
-      padding: const EdgeInsets.all(36),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(8),
-        boxShadow: const [
-          BoxShadow(
-              color: Colors.black54, blurRadius: 12, offset: Offset(0, 4)),
-        ],
-      ),
-      child: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: _buildSlideLines(text),
+      child: Container(
+        margin: const EdgeInsets.all(12),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final slideW = slideSize.widthPx.toDouble();
+            final slideH = slideSize.heightPx.toDouble();
+            final availW = constraints.maxWidth;
+            final availH = constraints.maxHeight;
+
+            if (availW <= 0 || availH <= 0 ||
+                availW == double.infinity ||
+                availH == double.infinity) {
+              return const Center(child: SizedBox.shrink());
+            }
+
+            // 计算缩放比例（保持宽高比）
+            final scaleW = availW / slideW;
+            final scaleH = availH / slideH;
+            final scale = scaleW < scaleH ? scaleW : scaleH;
+            final renderW = slideW * scale;
+            final renderH = slideH * scale;
+
+            final bgColor =
+                (slide.backgroundColor as Color?) ?? Colors.white;
+
+            // 检查是否空幻灯片
+            final hasContent = (slide.shapes as List).any(
+              (s) => s.hasText || (s.isImage && s.imageBytes != null),
+            );
+
+            return Center(
+              child: Container(
+                width: renderW,
+                height: renderH,
+                decoration: BoxDecoration(
+                  color: bgColor,
+                  borderRadius: BorderRadius.circular(4),
+                  boxShadow: const [
+                    BoxShadow(
+                        color: Colors.black54,
+                        blurRadius: 12,
+                        offset: Offset(0, 4)),
+                  ],
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: hasContent
+                    ? Stack(
+                        clipBehavior: Clip.hardEdge,
+                        children: _buildSlideShapes(slide, scale),
+                      )
+                    : Center(
+                        child: Text(
+                          '（本页无内容）',
+                          style: TextStyle(
+                            color: Colors.grey.shade400,
+                            fontSize: 14 * scale,
+                          ),
+                        ),
+                      ),
+              ),
+            );
+          },
         ),
       ),
     );
   }
 
-  List<Widget> _buildSlideLines(String text) {
-    final lines = text.split('\n').where((l) => l.isNotEmpty).toList();
-    if (lines.isEmpty) {
-      return [
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 40),
-          child: Text(
-            '（本页无文本内容）',
-            style: TextStyle(color: Colors.grey.shade500, fontSize: 16),
-          ),
-        ),
-      ];
-    }
+  /// 构建幻灯片上所有形状的 Positioned widget
+  List<Widget> _buildSlideShapes(dynamic slide, double scale) {
     final widgets = <Widget>[];
-    for (var i = 0; i < lines.length; i++) {
-      final line = lines[i];
-      // 第一行作为标题，加粗大字
-      final isTitle = i == 0 && line.length <= 60;
+    for (final shape in (slide.shapes as List)) {
+      final left = (shape.leftPx as double) * scale;
+      final top = (shape.topPx as double) * scale;
+      final width = (shape.widthPx as double) * scale;
+      final height = (shape.heightPx as double) * scale;
+
+      if (width <= 0 || height <= 0) continue;
+
       widgets.add(
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 6),
-          child: Text(
-            line,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: isTitle ? 24 : 18,
-              fontWeight: isTitle ? FontWeight.bold : FontWeight.normal,
-              color: Colors.black87,
-              height: 1.5,
-            ),
-          ),
+        Positioned(
+          left: left,
+          top: top,
+          width: width,
+          height: height,
+          child: _buildShapeContent(shape, scale),
         ),
       );
     }
     return widgets;
+  }
+
+  /// 构建单个形状内容
+  Widget _buildShapeContent(dynamic shape, double scale) {
+    // 图片
+    if (shape.isImage && shape.imageBytes != null) {
+      return Image.memory(
+        shape.imageBytes as Uint8List,
+        fit: BoxFit.fill,
+        gaplessPlayback: true,
+      );
+    }
+
+    // 形状填充色背景
+    final fillColor = shape.fillColor as Color?;
+
+    if (!shape.hasText) {
+      if (fillColor != null) {
+        return ColoredBox(color: fillColor);
+      }
+      return const SizedBox.shrink();
+    }
+
+    // 文本形状
+    final defaultFontSize = _getDefaultFontSize(shape);
+    final paragraphs = _buildParagraphs(shape, scale, defaultFontSize);
+
+    Widget content = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: paragraphs,
+    );
+
+    if (fillColor != null) {
+      content = DecoratedBox(
+        decoration: BoxDecoration(color: fillColor),
+        child: content,
+      );
+    }
+
+    return ClipRect(child: content);
+  }
+
+  /// 根据占位符类型获取默认字号（pt）
+  double _getDefaultFontSize(dynamic shape) {
+    final phType = shape.placeholderType as int?;
+    if (phType == 1 || phType == 3) return 36.0; // 标题
+    if (phType == 2 || phType == 4) return 18.0; // 正文/副标题
+    return 18.0;
+  }
+
+  /// 构建段落列表
+  List<Widget> _buildParagraphs(
+    dynamic shape,
+    double scale,
+    double defaultFontSize,
+  ) {
+    final widgets = <Widget>[];
+
+    for (final para in (shape.paragraphs as List)) {
+      final align = _paraAlign(para.align);
+      final lineSpacing = (para.lineSpacing as double?) ?? 1.2;
+
+      final spans = <TextSpan>[];
+      for (final run in (para.runs as List)) {
+        final style = run.style;
+        // fontSize 是 int?（pt），null 时用默认字号
+        final rawFontSize = style.fontSize;
+        final fontSize = (rawFontSize != null
+            ? (rawFontSize as num).toDouble()
+            : defaultFontSize) * scale;
+        final color =
+            (style.color as Color?) ?? const Color(0xFF000000);
+
+        spans.add(TextSpan(
+          text: run.text,
+          style: TextStyle(
+            fontSize: fontSize,
+            fontWeight: (style.bold as bool)
+                ? FontWeight.bold
+                : FontWeight.normal,
+            fontStyle: (style.italic as bool)
+                ? FontStyle.italic
+                : FontStyle.normal,
+            decoration: (style.underline as bool)
+                ? TextDecoration.underline
+                : TextDecoration.none,
+            color: color,
+            fontFamily: style.fontName as String?,
+            height: lineSpacing,
+          ),
+        ));
+      }
+
+      final spaceBefore = (para.spaceBefore as double?) ?? 0.0;
+      final spaceAfter = (para.spaceAfter as double?) ?? 0.0;
+
+      widgets.add(
+        Padding(
+          padding: EdgeInsets.only(
+            top: spaceBefore * scale,
+            bottom: spaceAfter * scale,
+          ),
+          child: RichText(
+            textAlign: align,
+            text: TextSpan(children: spans),
+            softWrap: true,
+            overflow: TextOverflow.clip,
+          ),
+        ),
+      );
+    }
+
+    return widgets;
+  }
+
+  /// 段落对齐方式转换（动态类型→TextAlign）
+  TextAlign _paraAlign(dynamic align) {
+    final s = align.toString();
+    if (s.contains('center')) return TextAlign.center;
+    if (s.contains('right')) return TextAlign.right;
+    if (s.contains('justify')) return TextAlign.justify;
+    return TextAlign.left;
   }
 
   // ─── 左右翻页箭头（非菜单状态下常驻小按钮）─────────────────
