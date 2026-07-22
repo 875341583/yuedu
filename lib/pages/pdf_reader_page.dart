@@ -19,6 +19,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
 import '../services/bookshelf_service.dart';
 import '../pdf/pdf_engines.dart';
+import '../plugins/plugin_manager.dart';
+import '../plugins/plugin.dart';
+import '../plugins/builtin/ai_layout_plugin.dart';
 
 /// PDF 视图模式：scroll=连续滚动，page=单页分页翻页
 enum PdfViewMode { scroll, page }
@@ -219,6 +222,12 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   /// 手动裁切：已确认的裁切区域（相对页面 0~1 比例坐标）
   Rect? _manualCropRect;
 
+  // ── v0.9.0: AI 重排状态 ──
+  bool _aiReflowing = false;
+
+  /// AI 插件是否已启用
+  bool _isAiPluginEnabled = false;
+
   /// 分栏检测结果缓存（pageNumber → ColumnDetectionResult）
   final Map<int, ColumnDetectionResult> _columnResults = {};
 
@@ -246,6 +255,8 @@ class _PdfReaderPageState extends State<PdfReaderPage>
     _applyOrientation(_orientMode);
     _initialPage = await _loadSavedPage();
     await _loadHighlights();
+    // 检查 AI 插件是否已启用
+    _isAiPluginEnabled = PluginManager.instance.isEnabled('pdf_ai_layout');
     if (!mounted) return;
     setState(() => _initialized = true);
     if (_viewMode == PdfViewMode.page) {
@@ -1371,6 +1382,152 @@ class _PdfReaderPageState extends State<PdfReaderPage>
   bool get _hasHighlightsOnCurrentPage =>
       (_highlightsByPage[_pageNumber ?? 1]?.isNotEmpty ?? false);
 
+  // ─── AI 重排（v0.9.0）─────────────────────────────────────
+
+  /// 用 AI 重排当前页：提取页面文本 → 调用 AI → 展示结果
+  Future<void> _aiReflowCurrentPage() async {
+    if (_aiReflowing) return;
+    final doc = _document;
+    final pageNum = _pageNumber;
+    if (doc == null || pageNum == null) return;
+
+    // 找到 AI 插件实例
+    final plugin = PluginManager.instance.all
+        .where((p) => p.id == 'pdf_ai_layout' && p is AiLayoutPlugin)
+        .cast<AiLayoutPlugin>()
+        .firstOrNull;
+    if (plugin == null) {
+      _showSnackBar('AI 重排插件未找到');
+      return;
+    }
+    if (!plugin.isConfigured) {
+      _showSnackBar('请先在插件设置中配置 AI API');
+      return;
+    }
+
+    setState(() => _aiReflowing = true);
+
+    try {
+      // 提取当前页文本
+      final page = doc.pages[pageNum - 1];
+      final pageText = await page.loadText();
+      final rawText = pageText.fullText;
+
+      if (rawText.trim().isEmpty) {
+        _showSnackBar('当前页无可提取的文本（可能是扫描件/图片页）');
+        return;
+      }
+
+      // 调用 AI 重排
+      final result = await plugin.execute(
+        context,
+        params: {'text': rawText},
+      );
+
+      if (result.type == PluginResultType.error) {
+        _showSnackBar(result.message ?? 'AI 重排失败');
+        return;
+      }
+
+      if (mounted && result.text != null) {
+        _showReflowResult(result.text!);
+      }
+    } catch (e) {
+      if (mounted) _showSnackBar('AI 重排失败: $e');
+    } finally {
+      if (mounted) setState(() => _aiReflowing = false);
+    }
+  }
+
+  void _showSnackBar(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
+    );
+  }
+
+  /// 展示 AI 重排结果
+  void _showReflowResult(String text) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return DraggableScrollableSheet(
+          initialChildSize: 0.7,
+          minChildSize: 0.3,
+          maxChildSize: 0.9,
+          expand: false,
+          builder: (_, scrollController) {
+            return Container(
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+              ),
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.auto_awesome, color: Colors.indigo),
+                        const SizedBox(width: 8),
+                        const Text('AI 重排结果',
+                            style: TextStyle(
+                                fontSize: 18, fontWeight: FontWeight.bold)),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () => Navigator.of(ctx).pop(),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      controller: scrollController,
+                      padding: const EdgeInsets.all(16),
+                      child: SelectableText(
+                        text,
+                        style: const TextStyle(
+                            fontSize: 16, height: 1.8, color: Colors.black87),
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: () {
+                              Clipboard.setData(ClipboardData(text: text));
+                              Navigator.of(ctx).pop();
+                              _showSnackBar('已复制到剪贴板');
+                            },
+                            icon: const Icon(Icons.copy, size: 18),
+                            label: const Text('复制全文'),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            icon: const Icon(Icons.check, size: 18),
+                            label: const Text('完成'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   // ─── 跟手翻页渲染（非 slide 模式）──────────────────────────
 
   Widget _buildPageTurnView(PdfDocument doc) {
@@ -2009,6 +2166,19 @@ class _PdfReaderPageState extends State<PdfReaderPage>
               child: Tooltip(
                 message: '清空本页高亮',
                 child: _floatIcon(Icons.delete_sweep_outlined),
+              ),
+            ),
+          ],
+          // ── v0.9.0: AI 重排按钮（仅当 AI 插件已启用时显示）──
+          if (_isAiPluginEnabled) ...[
+            const SizedBox(height: 8),
+            GestureDetector(
+              onTap: _aiReflowCurrentPage,
+              child: Tooltip(
+                message: 'AI 重排当前页',
+                child: _floatIcon(_aiReflowing
+                    ? Icons.hourglass_top
+                    : Icons.auto_awesome_outlined),
               ),
             ),
           ],

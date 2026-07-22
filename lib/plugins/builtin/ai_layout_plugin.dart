@@ -53,6 +53,48 @@ class AiLayoutPlugin extends YueDuPlugin {
     return const _AiLayoutSettingsPanel();
   }
 
+  // ── v0.9.0: 执行管道 ──────────────────────────────────
+
+  @override
+  Widget? buildActionButton(BuildContext context) {
+    // 阅读页浮标栏的"AI 重排"按钮，仅在已配置时显示
+    return null; // 由阅读页直接构建按钮，此处暂返回 null
+  }
+
+  /// 重排给定文本：调用 AI 将复杂排版转为适合小屏阅读的格式
+  @override
+  Future<PluginResult> execute(
+    BuildContext context, {
+    Map<String, dynamic>? params,
+  }) async {
+    final rawText = params?['text'] as String? ?? '';
+    if (rawText.isEmpty) {
+      return PluginResult.error('无可重排的文本内容');
+    }
+    if (!isConfigured) {
+      return PluginResult.error('AI API 未配置，请先在插件设置中填写 API 地址、密钥和模型名称');
+    }
+
+    final systemPrompt = '''你是一个专业文档排版重构助手。
+请将以下文档内容重构为适合手机小屏阅读的格式：
+1. 保留所有文字内容，不增删
+2. 按语义分段，每段不超过3-4行
+3. 标题独占一行，用【】标注
+4. 去除多余的空行和换行
+5. 如有表格，转为简洁文本列表
+6. 如有公式，用纯文本近似表示''';
+
+    try {
+      final result = await callApi(
+        systemPrompt: systemPrompt,
+        userMessage: rawText,
+      );
+      return PluginResult.text(result);
+    } catch (e) {
+      return PluginResult.error('AI 重排失败: $e');
+    }
+  }
+
   // ─── 用户设置 ──────────────────────────────────────────
   static const _kAiApiUrl = 'yuedu_ai_api_url';
   static const _kAiApiKey = 'yuedu_ai_api_key';

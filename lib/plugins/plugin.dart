@@ -90,7 +90,67 @@ abstract class YueDuPlugin {
   /// 构建设置面板（hasSettings=true 时调用）
   Widget? buildSettingsPanel(BuildContext context) => null;
 
+  /// ── 执行管道（v0.9.0 新增）──────────────────────────────
+  /// 插件的核心执行方法，由阅读页调用点触发。
+  ///
+  /// [context] — 调用方的 BuildContext（可用于弹对话框等）
+  /// [params] — 上下文参数，由调用点传入（如当前页文本、PDF文档等）
+  ///
+  /// 返回插件执行结果（如重排后的文本），失败抛异常。
+  /// 默认实现返回未实现，子类按需 override。
+  Future<PluginResult> execute(
+    BuildContext context, {
+    Map<String, dynamic>? params,
+  }) async {
+    throw UnimplementedError('${metadata.name} 尚未实现 execute()');
+  }
+
+  /// 是否提供操作按钮（阅读页浮标栏显示）
+  /// 返回 null 表示不显示按钮；返回 Widget 则在浮标栏渲染
+  Widget? buildActionButton(BuildContext context) => null;
+
   /// 便捷访问
   String get id => metadata.id;
   String get name => metadata.name;
+}
+
+/// 插件执行结果
+class PluginResult {
+  /// 结果类型
+  final PluginResultType type;
+
+  /// 文本内容（reflow/summary 等场景）
+  final String? text;
+
+  /// 附加数据（如分栏检测结果、OCR置信度等）
+  final Map<String, dynamic>? extra;
+
+  /// 用户可见的提示消息
+  final String? message;
+
+  const PluginResult({
+    required this.type,
+    this.text,
+    this.extra,
+    this.message,
+  });
+
+  factory PluginResult.text(String t) =>
+      PluginResult(type: PluginResultType.reflow, text: t);
+
+  factory PluginResult.message(String m) =>
+      PluginResult(type: PluginResultType.info, message: m);
+
+  factory PluginResult.error(String m) =>
+      PluginResult(type: PluginResultType.error, message: m);
+}
+
+/// 插件结果类型
+enum PluginResultType {
+  /// 文本重排结果
+  reflow,
+  /// 信息提示
+  info,
+  /// 错误
+  error,
 }
