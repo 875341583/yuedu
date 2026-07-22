@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>OFD Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; }
+        #ofd-content {
+            width: 100%;
+            height: 100%;
+            overflow-y: auto;
+            overflow-x: auto;
+            background-color: #e0e0e0;
+            -webkit-overflow-scrolling: touch;
+        }
+        #ofd-content > div {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #666;
+            font-size: 16px;
+            z-index: 100;
+        }
+        #ofd-content::-webkit-scrollbar { width: 4px; }
+        #ofd-content::-webkit-scrollbar-thumb {
+            background: rgba(0,0,0,0.2);
+            border-radius: 2px;
+        }
+        #ofd-content::-webkit-scrollbar-track { background: transparent; }
+    </style>
+</head>
+<body>
+    <div id="loading">正在加载OFD文件...</div>
+    <div id="ofd-content"></div>
+
+    <script src="liteofd.js"></script>
+    <script>
+        var liteOfd = null;
+        var ofdDocument = null;
+        var content = document.getElementById('ofd-content');
+        var loadingEl = document.getElementById('loading');
+        var currentScale = 1.0;
+
+        // Scroll listener for page change detection
+        var scrollTimer = null;
+        content.addEventListener('scroll', function() {
+            if (scrollTimer) clearTimeout(scrollTimer);
+            scrollTimer = setTimeout(detectCurrentPage, 150);
+        });
+
+        function detectCurrentPage() {
+            if (!liteOfd) return;
+            var pages = content.querySelectorAll('[data-page-index]');
+            if (pages.length === 0) return;
+            var viewportCenter = content.scrollTop + content.clientHeight / 2;
+            var closestPage = 0;
+            var closestDist = Infinity;
+            for (var i = 0; i < pages.length; i++) {
+                var rect = pages[i].getBoundingClientRect();
+                var pageCenter = pages[i].offsetTop + pages[i].offsetHeight / 2;
+                var dist = Math.abs(pageCenter - viewportCenter);
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    closestPage = parseInt(pages[i].getAttribute('data-page-index'));
+                }
+            }
+            if (closestPage > 0) {
+                if (window.OFDChannel) {
+                    window.OFDChannel.postMessage(JSON.stringify({
+                        type: 'pageChange',
+                        currentPage: closestPage,
+                        totalPages: liteOfd.totalPages || pages.length
+                    }));
+                }
+            }
+        }
+
+        window.addEventListener('ofdPageChange', function(event) {
+            var pageIndex = event.detail ? event.detail.pageIndex : 0;
+            var totalPages = liteOfd ? liteOfd.totalPages : 0;
+            if (window.OFDChannel) {
+                window.OFDChannel.postMessage(JSON.stringify({
+                    type: 'pageChange',
+                    currentPage: pageIndex,
+                    totalPages: totalPages
+                }));
+            }
+        });
+
+        window.loadOfdFromBase64 = function(base64Data) {
+            loadingEl.style.display = 'block';
+            loadingEl.textContent = '正在加载OFD文件...';
+            content.innerHTML = '';
+
+            try {
+                var binaryString = atob(base64Data);
+                var bytes = new Uint8Array(binaryString.length);
+                for (var i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                liteOfd = new liteofd.LiteOfd();
+
+                liteOfd.parse(bytes.buffer).then(function(data) {
+                    ofdDocument = data;
+                    console.log('OFD parsed, pages:', liteOfd.totalPages);
+
+                    var renderDiv = liteOfd.render(
+                        undefined,
+                        'background-color: white; margin: 8px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.15);'
+                    );
+
+                    // Tag pages with data-page-index for scroll detection
+                    var pageDivs = renderDiv.querySelectorAll('[class*="page"]');
+                    for (var j = 0; j < pageDivs.length; j++) {
+                        pageDivs[j].setAttribute('data-page-index', j + 1);
+                    }
+                    // If no page divs found, tag direct children
+                    if (pageDivs.length === 0) {
+                        var children = renderDiv.children;
+                        for (var k = 0; k < children.length; k++) {
+                            children[k].setAttribute('data-page-index', k + 1);
+                        }
+                    }
+
+                    content.appendChild(renderDiv);
+                    loadingEl.style.display = 'none';
+
+                    if (window.OFDChannel) {
+                        window.OFDChannel.postMessage(JSON.stringify({
+                            type: 'renderComplete',
+                            totalPages: liteOfd.totalPages,
+                            currentPage: 1
+                        }));
+                    }
+                }).catch(function(error) {
+                    console.error('OFD parse error:', error);
+                    loadingEl.textContent = '加载失败: ' + (error.message || error.toString());
+                    if (window.OFDChannel) {
+                        window.OFDChannel.postMessage(JSON.stringify({
+                            type: 'error',
+                            message: error.toString()
+                        }));
+                    }
+                });
+            } catch (e) {
+                console.error('base64 decode error:', e);
+                loadingEl.textContent = '解码失败: ' + e.message;
+                if (window.OFDChannel) {
+                    window.OFDChannel.postMessage(JSON.stringify({
+                        type: 'error',
+                        message: e.toString()
+                    }));
+                }
+            }
+        };
+
+        window.loadOfdFromUrl = function(fileUrl) {
+            loadingEl.style.display = 'block';
+            loadingEl.textContent = '正在加载OFD文件...';
+            content.innerHTML = '';
+
+            liteOfd = new liteofd.LiteOfd();
+
+            liteOfd.parse(fileUrl).then(function(data) {
+                ofdDocument = data;
+                var renderDiv = liteOfd.render(
+                    undefined,
+                    'background-color: white; margin: 8px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.15);'
+                );
+                content.appendChild(renderDiv);
+                loadingEl.style.display = 'none';
+
+                if (window.OFDChannel) {
+                    window.OFDChannel.postMessage(JSON.stringify({
+                        type: 'renderComplete',
+                        totalPages: liteOfd.totalPages,
+                        currentPage: 1
+                    }));
+                }
+            }).catch(function(error) {
+                console.error('OFD parse error:', error);
+                loadingEl.textContent = '加载失败: ' + (error.message || error.toString());
+                if (window.OFDChannel) {
+                    window.OFDChannel.postMessage(JSON.stringify({
+                        type: 'error',
+                        message: error.toString()
+                    }));
+                }
+            });
+        };
+
+        // Control methods
+        window.ofdNextPage = function() {
+            if (liteOfd) liteOfd.nextPage();
+        };
+
+        window.ofdPrevPage = function() {
+            if (liteOfd) liteOfd.prevPage();
+        };
+
+        window.ofdGoToPage = function(pageIndex) {
+            if (liteOfd) liteOfd.goToPage(pageIndex);
+        };
+
+        window.ofdZoomIn = function() {
+            currentScale = Math.min(currentScale + 0.2, 5.0);
+            if (liteOfd) liteOfd.zoom(currentScale);
+        };
+
+        window.ofdZoomOut = function() {
+            currentScale = Math.max(currentScale - 0.2, 0.3);
+            if (liteOfd) liteOfd.zoom(currentScale);
+        };
+
+        window.ofdResetZoom = function() {
+            currentScale = 1.0;
+            if (liteOfd) liteOfd.zoom(1.0);
+        };
+
+        window.ofdGetTotalPages = function() {
+            if (liteOfd) return liteOfd.totalPages;
+            return 0;
+        };
+
+        window.ofdGetCurrentPage = function() {
+            if (liteOfd) return liteOfd.currentPage;
+            return 0;
+        };
+
+        window.ofdGetContent = function(page) {
+            if (liteOfd) return liteOfd.getContent(page || null);
+            return '';
+        };
+
+        window.ofdGetAllText = function() {
+            if (!liteOfd) return '[]';
+            var results = [];
+            var total = liteOfd.totalPages;
+            for (var i = 1; i <= total; i++) {
+                results.push({ page: i, text: liteOfd.getContent(i) });
+            }
+            return JSON.stringify(results);
+        };
+
+        // Notify Flutter that JS is ready
+        if (window.OFDChannel) {
+            window.OFDChannel.postMessage(JSON.stringify({ type: 'ready' }));
+        }
+    </script>
+</body>
+</html>

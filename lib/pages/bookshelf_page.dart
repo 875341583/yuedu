@@ -13,6 +13,7 @@ import 'reader_page.dart';
 import 'pdf_reader_page.dart';
 import 'pptx_reader_page.dart';
 import 'xlsx_reader_page.dart';
+import 'ofd_viewer_page.dart';
 import 'plugin_center_page.dart';
 
 class BookshelfPage extends StatefulWidget {
@@ -287,6 +288,9 @@ class _BookshelfPageState extends State<BookshelfPage> {
         break;
       case BookFormat.xlsx:
         page = XlsxReaderPage(book: book);
+        break;
+      case BookFormat.ofd:
+        page = OfdViewerPage(book: book);
         break;
       default:
         page = ReaderPage(book: book);
